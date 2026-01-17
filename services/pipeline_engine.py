@@ -13,6 +13,9 @@ from config import settings, get_step_config, STEP_CONFIGS
 from websocket.manager import broadcast_message
 from agents import create_agent, AgentContext
 
+# Get max steps from config
+MAX_STEPS = settings.max_steps
+
 
 class PipelineEngine:
     """Engine for executing pipelines."""
@@ -27,6 +30,7 @@ class PipelineEngine:
         self.feedback = feedback
         self.guidance = guidance
         self._db = None
+        self._step_events: dict[int, list] = {}  # Track events per step for chronological storage
 
     async def get_db(self):
         """Get database connection."""
@@ -54,8 +58,8 @@ class PipelineEngine:
             "ticket_key": pipeline["ticket_key"],
         })
 
-        # Execute steps sequentially
-        while current_step <= 8:
+        # Execute steps sequentially (up to MAX_STEPS)
+        while current_step <= MAX_STEPS:
             # Check for pause request
             pipeline = await db.fetchone(
                 "SELECT pause_requested, status FROM pipelines WHERE id = ?",
@@ -79,7 +83,7 @@ class PipelineEngine:
             # Move to next step
             current_step += 1
 
-            if current_step <= 8:
+            if current_step <= MAX_STEPS:
                 await self._transition_to_step(current_step)
 
         # Pipeline complete
@@ -137,11 +141,16 @@ class PipelineEngine:
             result = await agent.execute(
                 context=AgentContext(**context),
                 on_token=lambda token: self._stream_token(step_number, token),
-                on_tool_call=lambda tool, args: self._log_tool_call(step["id"], tool, args),
+                on_tool_call=lambda tool, args, sn=step_number, sid=step["id"]: self._log_tool_call(sid, sn, tool, args),
             )
 
-            # Save output
+            # Save output with chronological events
             output_id = generate_id()
+            events = self._step_events.get(step_number, [])
+            content_json_data = {
+                "events": events,  # Chronological events for UI display
+                "structured_output": result.get("structured_output"),
+            }
             await db.execute("""
                 INSERT INTO step_outputs (id, step_id, output_type, content, content_json, created_at)
                 VALUES (?, ?, ?, ?, ?, ?)
@@ -150,9 +159,11 @@ class PipelineEngine:
                 step["id"],
                 config["output_type"],
                 result.get("content", ""),
-                json_dumps(result.get("structured_output")),
+                json_dumps(content_json_data),
                 now,
             ))
+            # Clear tracked events
+            self._step_events.pop(step_number, None)
 
             # Update step as completed
             completed_at = datetime.utcnow().isoformat()
@@ -176,7 +187,7 @@ class PipelineEngine:
                 "type": "step_completed",
                 "pipeline_id": self.pipeline_id,
                 "step": step_number,
-                "next_step": step_number + 1 if step_number < 8 else None,
+                "next_step": step_number + 1 if step_number < MAX_STEPS else None,
                 "tokens_used": result.get("tokens_used", 0),
                 "cost": result.get("cost", 0),
                 "output": result.get("content", "")[:5000],  # Truncate for websocket
@@ -258,7 +269,20 @@ class PipelineEngine:
         return context
 
     async def _stream_token(self, step_number: int, token: str):
-        """Stream token to clients."""
+        """Stream token to clients and track for chronological storage."""
+        # Track event for saving later
+        if step_number not in self._step_events:
+            self._step_events[step_number] = []
+
+        events = self._step_events[step_number]
+        now = datetime.utcnow().isoformat()
+        # Merge consecutive text events
+        if events and events[-1]["type"] == "text":
+            events[-1]["content"] += token
+            events[-1]["timestamp"] = now  # Update to latest
+        else:
+            events.append({"type": "text", "content": token, "timestamp": now})
+
         await broadcast_message({
             "type": "token",
             "pipeline_id": self.pipeline_id,
@@ -266,9 +290,20 @@ class PipelineEngine:
             "token": token,
         })
 
-    async def _log_tool_call(self, step_id: str, tool: str, args: dict):
-        """Log tool call to database."""
+    async def _log_tool_call(self, step_id: str, step_number: int, tool: str, args: dict):
+        """Log tool call to database and track for chronological storage."""
         db = await self.get_db()
+        now = datetime.utcnow().isoformat()
+
+        # Track event for saving later (chronological order)
+        if step_number not in self._step_events:
+            self._step_events[step_number] = []
+        self._step_events[step_number].append({
+            "type": "tool_call",
+            "tool": tool,
+            "arguments": args,
+            "timestamp": now,
+        })
 
         tool_call_id = generate_id()
         await db.execute("""
@@ -280,6 +315,7 @@ class PipelineEngine:
         await broadcast_message({
             "type": "tool_call_started",
             "pipeline_id": self.pipeline_id,
+            "step": step_number,
             "tool": tool,
             "arguments": args,
         })
@@ -406,7 +442,7 @@ class PipelineEngine:
             result = await agent.execute(
                 context=AgentContext(**context),
                 on_token=lambda token: self._stream_token(8, token),
-                on_tool_call=lambda tool, args: self._log_tool_call(step["id"], tool, args),
+                on_tool_call=lambda tool, args, sn=step_number, sid=step["id"]: self._log_tool_call(sid, sn, tool, args),
             )
 
             # Mark comments as processed

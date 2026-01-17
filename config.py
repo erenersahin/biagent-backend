@@ -56,6 +56,7 @@ class Settings(BaseSettings):
     # Agent Configuration
     max_retries_per_step: int = 3
     step_timeout_seconds: int = 600  # 10 minutes
+    max_steps: int = 6  # Number of steps to execute (1-8). Set to 6 to skip PR/Review steps
 
     class Config:
         env_file = ".env"

@@ -54,6 +54,7 @@ class AppConfigResponse(BaseModel):
     """App configuration for frontend."""
     developer_name: Optional[str] = None
     jira_project_key: Optional[str] = None
+    max_steps: int = 8  # Number of pipeline steps enabled (1-8)
 
 
 @router.get("/config", response_model=AppConfigResponse)
@@ -62,6 +63,7 @@ async def get_app_config():
     return AppConfigResponse(
         developer_name=settings.developer_name,
         jira_project_key=settings.jira_project_key,
+        max_steps=settings.max_steps,
     )
 
 

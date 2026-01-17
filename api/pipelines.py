@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from datetime import datetime
 
 from db import get_db, generate_id
-from config import get_step_config, get_step_name, STEP_CONFIGS
+from config import settings, get_step_config, get_step_name, STEP_CONFIGS
 from services.pipeline_engine import PipelineEngine
 
 
@@ -91,8 +91,11 @@ async def create_pipeline(request: PipelineCreate):
         VALUES (?, ?, 'pending', 1, ?)
     """, (pipeline_id, request.ticket_key, now))
 
-    # Create all 8 steps
+    # Create steps up to max_steps (configurable, default 6 to skip PR/Review)
+    max_steps = settings.max_steps
     for step_num, config in STEP_CONFIGS.items():
+        if step_num > max_steps:
+            continue
         step_id = generate_id()
         await db.execute("""
             INSERT INTO pipeline_steps (id, pipeline_id, step_number, step_name, status)
@@ -174,9 +177,70 @@ async def get_step(pipeline_id: str, step_number: int):
     return StepResponse(**step)
 
 
+@router.get("/{pipeline_id}/outputs")
+async def get_all_step_outputs(pipeline_id: str):
+    """Get outputs and tool calls for ALL steps in a single request."""
+    import json
+
+    db = await get_db()
+
+    # Get all steps for this pipeline
+    steps = await db.fetchall("""
+        SELECT id, step_number FROM pipeline_steps
+        WHERE pipeline_id = ?
+        ORDER BY step_number
+    """, (pipeline_id,))
+
+    if not steps:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+
+    result = {}
+    for step in steps:
+        step_num = step["step_number"]
+        step_id = step["id"]
+
+        # Get latest output including content_json for events
+        output = await db.fetchone("""
+            SELECT content, content_json FROM step_outputs
+            WHERE step_id = ?
+            ORDER BY created_at DESC LIMIT 1
+        """, (step_id,))
+
+        # Parse content_json to get events
+        events = []
+        if output and output["content_json"]:
+            try:
+                content_json = json.loads(output["content_json"])
+                events = content_json.get("events", [])
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        # Fallback: get tool calls from tool_calls table if no events
+        tool_calls = []
+        if not events:
+            tc_rows = await db.fetchall("""
+                SELECT tool_name, arguments, created_at
+                FROM tool_calls
+                WHERE step_id = ?
+                ORDER BY created_at ASC
+            """, (step_id,))
+            tool_calls = [
+                {"tool": tc["tool_name"], "arguments": tc["arguments"], "timestamp": tc["created_at"]}
+                for tc in tc_rows
+            ]
+
+        result[step_num] = {
+            "content": output["content"] if output else "",
+            "events": events,  # Chronological events (text + tool_call interleaved)
+            "tool_calls": tool_calls,  # Fallback for old data
+        }
+
+    return {"steps": result}
+
+
 @router.get("/{pipeline_id}/steps/{step_number}/output")
 async def get_step_output(pipeline_id: str, step_number: int):
-    """Get the output for a specific step."""
+    """Get the output for a specific step, including tool calls."""
     db = await get_db()
 
     step = await db.fetchone("""
@@ -193,7 +257,21 @@ async def get_step_output(pipeline_id: str, step_number: int):
         ORDER BY created_at DESC
     """, (step["id"],))
 
-    return {"outputs": outputs}
+    # Also get tool calls for this step
+    tool_calls = await db.fetchall("""
+        SELECT tool_name, arguments, created_at
+        FROM tool_calls
+        WHERE step_id = ?
+        ORDER BY created_at ASC
+    """, (step["id"],))
+
+    return {
+        "outputs": outputs,
+        "tool_calls": [
+            {"tool": tc["tool_name"], "arguments": tc["arguments"], "timestamp": tc["created_at"]}
+            for tc in tool_calls
+        ]
+    }
 
 
 @router.post("/{pipeline_id}/start")
