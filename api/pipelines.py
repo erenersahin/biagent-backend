@@ -1,0 +1,482 @@
+"""
+Pipelines API Router
+
+Endpoints for managing pipeline execution.
+"""
+
+from fastapi import APIRouter, HTTPException, BackgroundTasks
+from typing import Optional
+from pydantic import BaseModel
+from datetime import datetime
+
+from db import get_db, generate_id
+from config import get_step_config, get_step_name, STEP_CONFIGS
+from services.pipeline_engine import PipelineEngine
+
+
+router = APIRouter()
+
+
+class PipelineCreate(BaseModel):
+    """Request to create a new pipeline."""
+    ticket_key: str
+
+
+class PipelineResponse(BaseModel):
+    """Pipeline response model."""
+    id: str
+    ticket_key: str
+    status: str
+    current_step: int
+    created_at: str
+    started_at: Optional[str] = None
+    paused_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    total_tokens: int
+    total_cost: float
+
+
+class StepResponse(BaseModel):
+    """Step response model."""
+    id: str
+    step_number: int
+    step_name: str
+    status: str
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    tokens_used: int
+    cost: float
+    error_message: Optional[str] = None
+    retry_count: int
+
+
+class StepOutputResponse(BaseModel):
+    """Step output response model."""
+    id: str
+    output_type: str
+    content: Optional[str] = None
+    content_json: Optional[dict] = None
+    created_at: str
+
+
+class FeedbackRequest(BaseModel):
+    """Request to provide feedback on a step."""
+    feedback: str
+
+
+class RestartRequest(BaseModel):
+    """Request to restart pipeline from a step."""
+    from_step: int
+    guidance: Optional[str] = None
+
+
+@router.post("", response_model=PipelineResponse)
+async def create_pipeline(request: PipelineCreate):
+    """Create a new pipeline for a ticket."""
+    db = await get_db()
+
+    # Check if ticket exists
+    ticket = await db.fetchone(
+        "SELECT * FROM tickets WHERE key = ?", (request.ticket_key,)
+    )
+    if not ticket:
+        raise HTTPException(status_code=404, detail=f"Ticket {request.ticket_key} not found")
+
+    # Create pipeline
+    pipeline_id = generate_id()
+    now = datetime.utcnow().isoformat()
+
+    await db.execute("""
+        INSERT INTO pipelines (id, ticket_key, status, current_step, created_at)
+        VALUES (?, ?, 'pending', 1, ?)
+    """, (pipeline_id, request.ticket_key, now))
+
+    # Create all 8 steps
+    for step_num, config in STEP_CONFIGS.items():
+        step_id = generate_id()
+        await db.execute("""
+            INSERT INTO pipeline_steps (id, pipeline_id, step_number, step_name, status)
+            VALUES (?, ?, ?, ?, 'pending')
+        """, (step_id, pipeline_id, step_num, config["name"]))
+
+    await db.commit()
+
+    return PipelineResponse(
+        id=pipeline_id,
+        ticket_key=request.ticket_key,
+        status="pending",
+        current_step=1,
+        created_at=now,
+        total_tokens=0,
+        total_cost=0.0,
+    )
+
+
+@router.get("/by-ticket/{ticket_key}", response_model=PipelineResponse)
+async def get_pipeline_by_ticket(ticket_key: str):
+    """Get the latest pipeline for a ticket."""
+    db = await get_db()
+
+    pipeline = await db.fetchone("""
+        SELECT * FROM pipelines
+        WHERE ticket_key = ?
+        ORDER BY created_at DESC
+        LIMIT 1
+    """, (ticket_key,))
+
+    if not pipeline:
+        raise HTTPException(status_code=404, detail=f"No pipeline found for ticket {ticket_key}")
+
+    return PipelineResponse(**pipeline)
+
+
+@router.get("/{pipeline_id}", response_model=PipelineResponse)
+async def get_pipeline(pipeline_id: str):
+    """Get pipeline status."""
+    db = await get_db()
+
+    pipeline = await db.fetchone(
+        "SELECT * FROM pipelines WHERE id = ?", (pipeline_id,)
+    )
+    if not pipeline:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+
+    return PipelineResponse(**pipeline)
+
+
+@router.get("/{pipeline_id}/steps")
+async def get_pipeline_steps(pipeline_id: str):
+    """Get all steps for a pipeline."""
+    db = await get_db()
+
+    steps = await db.fetchall("""
+        SELECT * FROM pipeline_steps
+        WHERE pipeline_id = ?
+        ORDER BY step_number
+    """, (pipeline_id,))
+
+    return {"steps": [StepResponse(**s) for s in steps]}
+
+
+@router.get("/{pipeline_id}/steps/{step_number}")
+async def get_step(pipeline_id: str, step_number: int):
+    """Get a specific step."""
+    db = await get_db()
+
+    step = await db.fetchone("""
+        SELECT * FROM pipeline_steps
+        WHERE pipeline_id = ? AND step_number = ?
+    """, (pipeline_id, step_number))
+
+    if not step:
+        raise HTTPException(status_code=404, detail="Step not found")
+
+    return StepResponse(**step)
+
+
+@router.get("/{pipeline_id}/steps/{step_number}/output")
+async def get_step_output(pipeline_id: str, step_number: int):
+    """Get the output for a specific step."""
+    db = await get_db()
+
+    step = await db.fetchone("""
+        SELECT id FROM pipeline_steps
+        WHERE pipeline_id = ? AND step_number = ?
+    """, (pipeline_id, step_number))
+
+    if not step:
+        raise HTTPException(status_code=404, detail="Step not found")
+
+    outputs = await db.fetchall("""
+        SELECT * FROM step_outputs
+        WHERE step_id = ?
+        ORDER BY created_at DESC
+    """, (step["id"],))
+
+    return {"outputs": outputs}
+
+
+@router.post("/{pipeline_id}/start")
+async def start_pipeline(pipeline_id: str, background_tasks: BackgroundTasks):
+    """Start pipeline execution."""
+    db = await get_db()
+
+    pipeline = await db.fetchone(
+        "SELECT * FROM pipelines WHERE id = ?", (pipeline_id,)
+    )
+    if not pipeline:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+
+    if pipeline["status"] not in ("pending", "paused"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Pipeline cannot be started from status: {pipeline['status']}"
+        )
+
+    # Update pipeline status
+    now = datetime.utcnow().isoformat()
+    await db.execute("""
+        UPDATE pipelines
+        SET status = 'running', started_at = COALESCE(started_at, ?), pause_requested = FALSE
+        WHERE id = ?
+    """, (now, pipeline_id))
+
+    # Update first step
+    await db.execute("""
+        UPDATE pipeline_steps
+        SET status = 'running', started_at = ?
+        WHERE pipeline_id = ? AND step_number = ?
+    """, (now, pipeline_id, pipeline["current_step"]))
+
+    await db.commit()
+
+    # Start execution in background
+    engine = PipelineEngine(pipeline_id)
+    background_tasks.add_task(engine.run)
+
+    return {"status": "started", "pipeline_id": pipeline_id}
+
+
+@router.post("/{pipeline_id}/pause")
+async def pause_pipeline(pipeline_id: str):
+    """Pause pipeline execution."""
+    db = await get_db()
+
+    pipeline = await db.fetchone(
+        "SELECT * FROM pipelines WHERE id = ?", (pipeline_id,)
+    )
+    if not pipeline:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+
+    if pipeline["status"] != "running":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Pipeline cannot be paused from status: {pipeline['status']}"
+        )
+
+    # Set pause request flag
+    await db.execute("""
+        UPDATE pipelines
+        SET pause_requested = TRUE
+        WHERE id = ?
+    """, (pipeline_id,))
+    await db.commit()
+
+    return {"status": "pause_requested", "pipeline_id": pipeline_id}
+
+
+@router.post("/{pipeline_id}/resume")
+async def resume_pipeline(pipeline_id: str, background_tasks: BackgroundTasks):
+    """Resume paused pipeline."""
+    db = await get_db()
+
+    pipeline = await db.fetchone(
+        "SELECT * FROM pipelines WHERE id = ?", (pipeline_id,)
+    )
+    if not pipeline:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+
+    if pipeline["status"] != "paused":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Pipeline cannot be resumed from status: {pipeline['status']}"
+        )
+
+    now = datetime.utcnow().isoformat()
+    await db.execute("""
+        UPDATE pipelines
+        SET status = 'running', pause_requested = FALSE
+        WHERE id = ?
+    """, (pipeline_id,))
+
+    await db.execute("""
+        UPDATE pipeline_steps
+        SET status = 'running'
+        WHERE pipeline_id = ? AND step_number = ?
+    """, (pipeline_id, pipeline["current_step"]))
+
+    await db.commit()
+
+    # Resume execution
+    engine = PipelineEngine(pipeline_id)
+    background_tasks.add_task(engine.run)
+
+    return {"status": "resumed", "pipeline_id": pipeline_id}
+
+
+@router.post("/{pipeline_id}/restart")
+async def restart_pipeline(
+    pipeline_id: str,
+    request: RestartRequest,
+    background_tasks: BackgroundTasks
+):
+    """Restart pipeline from a specific step."""
+    db = await get_db()
+
+    pipeline = await db.fetchone(
+        "SELECT * FROM pipelines WHERE id = ?", (pipeline_id,)
+    )
+    if not pipeline:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+
+    if request.from_step < 1 or request.from_step > 8:
+        raise HTTPException(status_code=400, detail="Invalid step number")
+
+    now = datetime.utcnow().isoformat()
+
+    # Reset pipeline
+    await db.execute("""
+        UPDATE pipelines
+        SET status = 'running', current_step = ?, pause_requested = FALSE
+        WHERE id = ?
+    """, (request.from_step, pipeline_id))
+
+    # Reset steps from_step onwards
+    await db.execute("""
+        UPDATE pipeline_steps
+        SET status = 'pending', started_at = NULL, completed_at = NULL,
+            tokens_used = 0, cost = 0, error_message = NULL
+        WHERE pipeline_id = ? AND step_number >= ?
+    """, (pipeline_id, request.from_step))
+
+    # Set current step to running
+    await db.execute("""
+        UPDATE pipeline_steps
+        SET status = 'running', started_at = ?
+        WHERE pipeline_id = ? AND step_number = ?
+    """, (now, pipeline_id, request.from_step))
+
+    # Delete outputs for reset steps
+    step_ids = await db.fetchall("""
+        SELECT id FROM pipeline_steps
+        WHERE pipeline_id = ? AND step_number >= ?
+    """, (pipeline_id, request.from_step))
+
+    for step in step_ids:
+        await db.execute(
+            "DELETE FROM step_outputs WHERE step_id = ?", (step["id"],)
+        )
+
+    await db.commit()
+
+    # Start execution
+    engine = PipelineEngine(pipeline_id, guidance=request.guidance)
+    background_tasks.add_task(engine.run)
+
+    return {
+        "status": "restarted",
+        "pipeline_id": pipeline_id,
+        "from_step": request.from_step
+    }
+
+
+@router.post("/{pipeline_id}/steps/{step_number}/feedback")
+async def provide_step_feedback(
+    pipeline_id: str,
+    step_number: int,
+    request: FeedbackRequest,
+    background_tasks: BackgroundTasks
+):
+    """Provide feedback on a step, triggering re-execution."""
+    db = await get_db()
+
+    step = await db.fetchone("""
+        SELECT * FROM pipeline_steps
+        WHERE pipeline_id = ? AND step_number = ?
+    """, (pipeline_id, step_number))
+
+    if not step:
+        raise HTTPException(status_code=404, detail="Step not found")
+
+    now = datetime.utcnow().isoformat()
+
+    # Save feedback
+    feedback_id = generate_id()
+    await db.execute("""
+        INSERT INTO step_feedback (id, step_id, feedback_text, created_at)
+        VALUES (?, ?, ?, ?)
+    """, (feedback_id, step["id"], request.feedback, now))
+
+    # Archive current output
+    outputs = await db.fetchall(
+        "SELECT * FROM step_outputs WHERE step_id = ?", (step["id"],)
+    )
+    for output in outputs:
+        await db.execute("""
+            INSERT INTO step_output_history
+            (id, step_id, attempt_number, output_type, content, content_json, feedback_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            generate_id(),
+            step["id"],
+            step["retry_count"] + 1,
+            output["output_type"],
+            output["content"],
+            output["content_json"],
+            feedback_id,
+            now
+        ))
+
+    # Delete current outputs
+    await db.execute("DELETE FROM step_outputs WHERE step_id = ?", (step["id"],))
+
+    # Reset step
+    await db.execute("""
+        UPDATE pipeline_steps
+        SET status = 'running', started_at = ?, retry_count = retry_count + 1,
+            last_feedback_id = ?, error_message = NULL
+        WHERE id = ?
+    """, (now, feedback_id, step["id"]))
+
+    # Reset subsequent steps
+    await db.execute("""
+        UPDATE pipeline_steps
+        SET status = 'pending', started_at = NULL, completed_at = NULL,
+            tokens_used = 0, cost = 0, error_message = NULL
+        WHERE pipeline_id = ? AND step_number > ?
+    """, (pipeline_id, step_number))
+
+    # Update pipeline
+    await db.execute("""
+        UPDATE pipelines
+        SET status = 'running', current_step = ?, pause_requested = FALSE
+        WHERE id = ?
+    """, (step_number, pipeline_id))
+
+    await db.commit()
+
+    # Re-run step with feedback
+    engine = PipelineEngine(pipeline_id, feedback=request.feedback)
+    background_tasks.add_task(engine.run)
+
+    return {
+        "status": "step_restarted",
+        "step": step_number,
+        "with_feedback": True
+    }
+
+
+@router.get("/{pipeline_id}/steps/{step_number}/history")
+async def get_step_history(pipeline_id: str, step_number: int):
+    """Get step revision history."""
+    db = await get_db()
+
+    step = await db.fetchone("""
+        SELECT id FROM pipeline_steps
+        WHERE pipeline_id = ? AND step_number = ?
+    """, (pipeline_id, step_number))
+
+    if not step:
+        raise HTTPException(status_code=404, detail="Step not found")
+
+    history = await db.fetchall("""
+        SELECT
+            h.*,
+            f.feedback_text
+        FROM step_output_history h
+        LEFT JOIN step_feedback f ON h.feedback_id = f.id
+        WHERE h.step_id = ?
+        ORDER BY h.attempt_number DESC
+    """, (step["id"],))
+
+    return {"history": history}
