@@ -5,13 +5,14 @@ Endpoints for managing pipeline execution.
 """
 
 from fastapi import APIRouter, HTTPException, BackgroundTasks
-from typing import Optional
+from typing import Optional, Dict, List
 from pydantic import BaseModel
 from datetime import datetime
 
 from db import get_db, generate_id
 from config import settings, get_step_config, get_step_name, STEP_CONFIGS
 from services.pipeline_engine import PipelineEngine
+from services.worktree_manager import WorktreeManager
 
 
 router = APIRouter()
@@ -68,6 +69,12 @@ class RestartRequest(BaseModel):
     """Request to restart pipeline from a step."""
     from_step: int
     guidance: Optional[str] = None
+
+
+class ProvideInputRequest(BaseModel):
+    """Request to provide user input for pipeline (e.g., setup commands)."""
+    input_type: str  # "setup_commands"
+    data: Dict[str, List[str]]  # For setup_commands: repo_name -> list of commands
 
 
 @router.post("", response_model=PipelineResponse)
@@ -558,3 +565,75 @@ async def get_step_history(pipeline_id: str, step_number: int):
     """, (step["id"],))
 
     return {"history": history}
+
+
+@router.post("/{pipeline_id}/provide-input")
+async def provide_pipeline_input(
+    pipeline_id: str,
+    request: ProvideInputRequest,
+    background_tasks: BackgroundTasks
+):
+    """Provide user input for a pipeline waiting on input (e.g., worktree setup commands).
+
+    This endpoint is used when the pipeline is in 'needs_user_input' status.
+    Currently supports:
+    - input_type="setup_commands": Provide setup commands for worktree repos
+    """
+    db = await get_db()
+
+    pipeline = await db.fetchone(
+        "SELECT * FROM pipelines WHERE id = ?", (pipeline_id,)
+    )
+    if not pipeline:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+
+    if pipeline["status"] != "needs_user_input":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Pipeline is not waiting for input. Current status: {pipeline['status']}"
+        )
+
+    if request.input_type == "setup_commands":
+        if not settings.worktree_enabled:
+            raise HTTPException(
+                status_code=400,
+                detail="Worktree feature is not enabled"
+            )
+
+        # Find the worktree session for this pipeline
+        session = await db.fetchone(
+            "SELECT * FROM worktree_sessions WHERE pipeline_id = ?",
+            (pipeline_id,)
+        )
+        if not session:
+            raise HTTPException(
+                status_code=404,
+                detail="No worktree session found for this pipeline"
+            )
+
+        # Provide the user input and run setup
+        manager = WorktreeManager()
+        try:
+            await manager.provide_user_input(session["id"], request.data)
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to process setup commands: {str(e)}"
+            )
+
+        # Resume the pipeline execution
+        engine = PipelineEngine(pipeline_id)
+        background_tasks.add_task(engine.resume_after_user_input)
+
+        return {
+            "status": "input_received",
+            "pipeline_id": pipeline_id,
+            "input_type": request.input_type,
+            "message": "Setup commands received. Pipeline will resume."
+        }
+
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown input type: {request.input_type}"
+        )

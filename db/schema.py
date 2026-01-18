@@ -313,4 +313,50 @@ CREATE TABLE IF NOT EXISTS offline_events (
     acknowledged BOOLEAN DEFAULT FALSE,
     FOREIGN KEY (session_id) REFERENCES sessions(id)
 );
+
+-- ============================================================
+-- GIT WORKTREE ISOLATION
+-- ============================================================
+
+-- Worktree session for a pipeline (may contain multiple repos)
+CREATE TABLE IF NOT EXISTS worktree_sessions (
+    id TEXT PRIMARY KEY,
+    pipeline_id TEXT NOT NULL,
+    ticket_key TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',  -- 'pending', 'creating', 'ready', 'needs_user_input', 'failed', 'cleaned'
+    base_path TEXT NOT NULL,                 -- e.g., biagent-worktrees/PROJ-123/
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    ready_at TIMESTAMP,
+    cleaned_at TIMESTAMP,
+    error_message TEXT,
+    user_input_request TEXT,                 -- JSON: what input is needed
+    user_input_response TEXT,                -- JSON: user's response
+    FOREIGN KEY (pipeline_id) REFERENCES pipelines(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_worktree_sessions_pipeline ON worktree_sessions(pipeline_id);
+CREATE INDEX IF NOT EXISTS idx_worktree_sessions_status ON worktree_sessions(status);
+CREATE INDEX IF NOT EXISTS idx_worktree_sessions_ticket ON worktree_sessions(ticket_key);
+
+-- Individual repo worktrees within a session
+CREATE TABLE IF NOT EXISTS worktree_repos (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    repo_name TEXT NOT NULL,
+    repo_path TEXT NOT NULL,                 -- Path to main repo
+    worktree_path TEXT NOT NULL,             -- Path to worktree
+    branch_name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',  -- 'pending', 'creating', 'setup', 'ready', 'failed'
+    setup_commands TEXT,                     -- JSON: detected or user-provided commands
+    setup_output TEXT,                       -- Output from setup commands
+    pr_url TEXT,                             -- PR created for this repo
+    pr_merged BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    ready_at TIMESTAMP,
+    FOREIGN KEY (session_id) REFERENCES worktree_sessions(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_worktree_repos_session ON worktree_repos(session_id);
+CREATE INDEX IF NOT EXISTS idx_worktree_repos_branch ON worktree_repos(branch_name);
+CREATE INDEX IF NOT EXISTS idx_worktree_repos_pr ON worktree_repos(pr_url);
 """

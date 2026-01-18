@@ -199,6 +199,8 @@ async def handle_pr_event(payload: dict, action: str):
 
     pr = payload.get("pull_request", {})
     pr_number = pr.get("number")
+    pr_url = pr.get("html_url", "")
+    branch_name = pr.get("head", {}).get("ref", "")
 
     if not pr_number:
         return
@@ -207,22 +209,80 @@ async def handle_pr_event(payload: dict, action: str):
         SELECT * FROM pull_requests WHERE pr_number = ?
     """, (pr_number,))
 
-    if not pr_record:
-        return
-
     now = datetime.utcnow().isoformat()
 
     if action == "closed":
         if pr.get("merged"):
-            await db.execute("""
-                UPDATE pull_requests SET status = 'merged', merged_at = ? WHERE id = ?
-            """, (now, pr_record["id"]))
+            # Update PR record if it exists
+            if pr_record:
+                await db.execute("""
+                    UPDATE pull_requests SET status = 'merged', merged_at = ? WHERE id = ?
+                """, (now, pr_record["id"]))
+
+            # Check if this is a BiAgent branch and trigger worktree cleanup
+            if settings.worktree_enabled and branch_name.startswith(settings.sandbox_branch_prefix):
+                await handle_biagent_branch_merged(branch_name, pr_url, db, now)
         else:
-            await db.execute("""
-                UPDATE pull_requests SET status = 'closed' WHERE id = ?
-            """, (pr_record["id"],))
+            if pr_record:
+                await db.execute("""
+                    UPDATE pull_requests SET status = 'closed' WHERE id = ?
+                """, (pr_record["id"],))
 
         await db.commit()
+
+
+async def handle_biagent_branch_merged(branch_name: str, pr_url: str, db, now: str):
+    """Handle cleanup when a BiAgent branch is merged.
+
+    This marks the worktree repo as merged and triggers cleanup if all PRs are merged.
+    """
+    # Find worktree repo with this branch or PR URL
+    repo = await db.fetchone("""
+        SELECT wr.*, ws.id as session_id, ws.pipeline_id
+        FROM worktree_repos wr
+        JOIN worktree_sessions ws ON wr.session_id = ws.id
+        WHERE wr.branch_name = ? OR wr.pr_url = ?
+    """, (branch_name, pr_url))
+
+    if not repo:
+        return
+
+    # Mark repo as merged
+    await db.execute("""
+        UPDATE worktree_repos SET pr_merged = TRUE WHERE id = ?
+    """, (repo["id"],))
+    await db.commit()
+
+    # Broadcast merge event
+    await broadcast_message({
+        "type": "worktree_pr_merged",
+        "pipeline_id": repo["pipeline_id"],
+        "repo_name": repo["repo_name"],
+        "branch_name": branch_name,
+        "pr_url": pr_url,
+    })
+
+    # Check if all PRs in the session are merged
+    unmerged = await db.fetchone("""
+        SELECT COUNT(*) as count FROM worktree_repos
+        WHERE session_id = ? AND pr_url IS NOT NULL AND pr_merged = FALSE
+    """, (repo["session_id"],))
+
+    if unmerged["count"] == 0:
+        # All PRs merged - trigger cleanup
+        from services.worktree_manager import WorktreeManager
+
+        manager = WorktreeManager()
+        try:
+            await manager.cleanup_session(repo["session_id"])
+            await broadcast_message({
+                "type": "worktree_session_cleaned",
+                "pipeline_id": repo["pipeline_id"],
+                "session_id": repo["session_id"],
+                "reason": "all_prs_merged",
+            })
+        except Exception as e:
+            print(f"Failed to cleanup worktree session {repo['session_id']}: {e}")
 
 
 async def debounce_review_processing(pr_id: str, pipeline_id: str):

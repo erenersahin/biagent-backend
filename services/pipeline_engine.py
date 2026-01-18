@@ -6,7 +6,7 @@ Orchestrates the 8-step agent pipeline for ticket resolution.
 
 import asyncio
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List, Dict
 
 from db import get_db, generate_id, json_dumps, json_loads
 from config import settings, get_step_config, STEP_CONFIGS
@@ -31,6 +31,9 @@ class PipelineEngine:
         self.guidance = guidance
         self._db = None
         self._step_events: dict[int, list] = {}  # Track events per step for chronological storage
+        self._worktree_manager = None  # Initialized if worktrees enabled
+        self._worktree_session = None  # Current worktree session
+        self._worktree_paths: Dict[str, str] = {}  # repo_name -> worktree_path mapping
 
     async def get_db(self):
         """Get database connection."""
@@ -193,6 +196,13 @@ class PipelineEngine:
                 "output": result.get("content", "")[:5000],  # Truncate for websocket
             })
 
+            # After step 1 (Context Agent), set up worktrees if enabled
+            if step_number == 1 and settings.worktree_enabled:
+                worktree_ready = await self._setup_worktrees_after_context(result)
+                if not worktree_ready:
+                    # Pipeline is waiting for user input
+                    return False
+
             return True
 
         except Exception as e:
@@ -231,6 +241,17 @@ class PipelineEngine:
             "SELECT * FROM tickets WHERE key = ?", (pipeline["ticket_key"],)
         )
 
+        # Determine codebase path - use worktree if available
+        codebase_path = settings.codebase_path
+        is_worktree = False
+
+        if settings.worktree_enabled and self._worktree_paths:
+            # Use first worktree path as primary (for single-repo tickets)
+            # For multi-repo, agents will need to handle multiple paths
+            first_repo = list(self._worktree_paths.keys())[0]
+            codebase_path = self._worktree_paths[first_repo]
+            is_worktree = True
+
         context = {
             "pipeline_id": self.pipeline_id,
             "ticket_key": pipeline["ticket_key"],
@@ -241,8 +262,10 @@ class PipelineEngine:
                 "status": ticket["status"],
                 "priority": ticket["priority"],
             },
-            "codebase_path": settings.codebase_path,
+            "codebase_path": codebase_path,
             "sandbox_branch": f"{settings.sandbox_branch_prefix}{pipeline['ticket_key']}",
+            "is_worktree": is_worktree,
+            "worktree_paths": self._worktree_paths if is_worktree else {},
         }
 
         # Add outputs from previous steps
@@ -385,6 +408,128 @@ class PipelineEngine:
             "total_tokens": pipeline["total_tokens"],
             "total_cost": pipeline["total_cost"],
         })
+
+    async def _setup_worktrees_after_context(self, context_result: dict) -> bool:
+        """
+        Set up worktrees after Context Agent completes.
+
+        Returns True if worktrees are ready, False if waiting for user input.
+        """
+        from .worktree_manager import WorktreeManager, AffectedRepo
+
+        db = await self.get_db()
+        pipeline = await db.fetchone(
+            "SELECT ticket_key FROM pipelines WHERE id = ?",
+            (self.pipeline_id,)
+        )
+
+        # Initialize worktree manager
+        self._worktree_manager = WorktreeManager()
+
+        # Extract affected repos from context output
+        structured = context_result.get("structured_output", {})
+        affected_repos_data = structured.get("affected_repos", []) if structured else []
+
+        # If no repos detected, try to detect all repos in base path
+        if not affected_repos_data:
+            all_repos = await self._worktree_manager.detect_repos()
+            affected_repos_data = [{"name": r, "reason": "Auto-detected"} for r in all_repos]
+
+        if not affected_repos_data:
+            # No repos found, continue without worktrees
+            return True
+
+        # Convert to AffectedRepo objects
+        affected_repos = [
+            AffectedRepo(name=r.get("name", r), reason=r.get("reason", ""))
+            for r in affected_repos_data
+        ]
+
+        try:
+            # Create worktree session
+            session = await self._worktree_manager.create_session(
+                pipeline_id=self.pipeline_id,
+                ticket_key=pipeline["ticket_key"],
+                affected_repos=affected_repos
+            )
+            self._worktree_session = session
+
+            # Run setup
+            setup_result = await self._worktree_manager.run_setup(session.id)
+
+            if setup_result.needs_user_input:
+                # Update pipeline status
+                await db.execute("""
+                    UPDATE pipelines SET status = 'needs_user_input' WHERE id = ?
+                """, (self.pipeline_id,))
+                await db.commit()
+
+                # Broadcast needs input
+                await broadcast_message({
+                    "type": "pipeline_needs_input",
+                    "pipeline_id": self.pipeline_id,
+                    "input_type": "setup_commands",
+                    "repos": setup_result.repos_needing_input,
+                })
+
+                return False
+
+            # Store worktree paths for use in agent context
+            for repo in session.repos:
+                self._worktree_paths[repo.repo_name] = repo.worktree_path
+
+            return True
+
+        except Exception as e:
+            # Log error but continue without worktrees
+            await broadcast_message({
+                "type": "worktree_error",
+                "pipeline_id": self.pipeline_id,
+                "error": str(e),
+            })
+            return True  # Continue without worktrees
+
+    async def resume_after_user_input(self, setup_commands: Dict[str, List[str]]):
+        """
+        Resume pipeline after user provides setup commands.
+
+        Called when user provides input for worktree setup.
+        """
+        if not self._worktree_manager or not self._worktree_session:
+            from .worktree_manager import WorktreeManager
+            self._worktree_manager = WorktreeManager()
+            self._worktree_session = await self._worktree_manager.get_session_by_pipeline(
+                self.pipeline_id
+            )
+
+        if not self._worktree_session:
+            return
+
+        # Apply user input and run setup
+        setup_result = await self._worktree_manager.provide_user_input(
+            self._worktree_session.id,
+            setup_commands
+        )
+
+        if setup_result.success:
+            # Reload session to get updated paths
+            self._worktree_session = await self._worktree_manager.get_session_by_pipeline(
+                self.pipeline_id
+            )
+
+            # Store worktree paths
+            for repo in self._worktree_session.repos:
+                self._worktree_paths[repo.repo_name] = repo.worktree_path
+
+            # Update pipeline status and resume
+            db = await self.get_db()
+            await db.execute("""
+                UPDATE pipelines SET status = 'running' WHERE id = ?
+            """, (self.pipeline_id,))
+            await db.commit()
+
+            # Continue pipeline execution
+            await self.run()
 
     async def run_review_step(self, comments: list[dict]):
         """Run the review agent for PR comments."""

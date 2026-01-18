@@ -48,6 +48,32 @@ class Settings(BaseSettings):
     )
     sandbox_branch_prefix: str = "biagent/"
 
+    # Worktree Configuration
+    worktree_enabled: bool = Field(
+        default=False,
+        description="Enable git worktree isolation for pipelines"
+    )
+    worktree_base_path: str = Field(
+        default="/home/eren/Projects/medsien",
+        description="Base path containing git repositories"
+    )
+    worktree_storage_path: str = Field(
+        default="/home/eren/Projects/medsien/biagent-worktrees",
+        description="Directory where worktrees will be created"
+    )
+    worktree_source_branch: str = Field(
+        default="develop",
+        description="Branch to create worktrees from"
+    )
+    worktree_setup_timeout_seconds: int = Field(
+        default=300,
+        description="Timeout for worktree setup operations (5 minutes)"
+    )
+    worktree_cleanup_on_merge: bool = Field(
+        default=True,
+        description="Cleanup worktrees after PR is merged to develop"
+    )
+
     # WebSocket Configuration
     ws_heartbeat_interval: int = 30
     token_buffer_size: int = 1000

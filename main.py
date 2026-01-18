@@ -12,7 +12,7 @@ import uvicorn
 
 from config import settings
 from db import get_db, close_db
-from api import tickets, pipelines, webhooks, session
+from api import tickets, pipelines, webhooks, session, worktrees
 from websocket import manager as ws_manager
 from services.jira_sync import start_sync_scheduler, stop_sync_scheduler
 
@@ -62,6 +62,7 @@ app.include_router(tickets.router, prefix="/api/tickets", tags=["tickets"])
 app.include_router(pipelines.router, prefix="/api/pipelines", tags=["pipelines"])
 app.include_router(webhooks.router, prefix="/api/webhooks", tags=["webhooks"])
 app.include_router(session.router, prefix="/api/session", tags=["session"])
+app.include_router(worktrees.router, prefix="/api/worktrees", tags=["worktrees"])
 
 # WebSocket endpoint
 app.include_router(ws_manager.router, tags=["websocket"])

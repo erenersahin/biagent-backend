@@ -4,8 +4,11 @@ Context Agent (Step 1)
 Gathers context and requirements for the ticket.
 """
 
-from typing import Optional
+import re
+import json
+from typing import Optional, List, Dict
 from .base import BaseAgent, AgentContext
+from config import settings
 
 
 class ContextAgent(BaseAgent):
@@ -13,7 +16,7 @@ class ContextAgent(BaseAgent):
 
     @property
     def system_prompt(self) -> str:
-        return """You are the Context & Requirements Agent for BiAgent, an AI-powered development system.
+        base_prompt = """You are the Context & Requirements Agent for BiAgent, an AI-powered development system.
 
 Your role is to gather all necessary context for implementing a JIRA ticket. You will:
 
@@ -21,7 +24,14 @@ Your role is to gather all necessary context for implementing a JIRA ticket. You
 2. Find related tickets and dependencies
 3. Search the codebase for relevant files and patterns
 4. Identify key requirements and constraints
-5. Fetch any relevant documentation from Notion
+5. Fetch any relevant documentation from Notion"""
+
+        # Add repo detection instructions if worktrees are enabled
+        if settings.worktree_enabled:
+            base_prompt += """
+6. Determine which repositories are affected by this ticket"""
+
+        base_prompt += """
 
 OUTPUT FORMAT:
 Your output should be a comprehensive context summary that includes:
@@ -29,9 +39,33 @@ Your output should be a comprehensive context summary that includes:
 - Related tickets and their status
 - Relevant codebase files identified
 - Technical constraints discovered
-- Any questions or ambiguities found
+- Any questions or ambiguities found"""
+
+        if settings.worktree_enabled:
+            base_prompt += """
+
+IMPORTANT - AFFECTED REPOSITORIES:
+The codebase may contain multiple git repositories. You must analyze which repositories
+need to be modified to implement this ticket.
+
+At the END of your output, include a JSON block with the affected repos:
+
+```json
+{
+  "affected_repos": [
+    {"name": "repo-name-1", "reason": "Brief reason why this repo is affected"},
+    {"name": "repo-name-2", "reason": "Brief reason why this repo is affected"}
+  ]
+}
+```
+
+If you cannot determine affected repos from the ticket, list all repos you find in the codebase path."""
+
+        base_prompt += """
 
 Be thorough but concise. Focus on information that will help the subsequent agents."""
+
+        return base_prompt
 
     def build_user_prompt(self, context: AgentContext) -> str:
         prompt = f"""Please gather context for the following JIRA ticket:
@@ -65,9 +99,39 @@ USER FEEDBACK (address this in your analysis):
 
     def parse_output(self, content: str) -> Optional[dict]:
         """Parse context output into structured format."""
-        return {
+        result = {
             "raw_context": content,
             "ticket_key": None,  # Would parse from content
             "relevant_files": [],  # Would parse from content
             "requirements": [],  # Would parse from content
+            "affected_repos": [],  # Extracted repo list for worktree creation
         }
+
+        # Extract affected_repos from JSON block if present
+        if settings.worktree_enabled:
+            affected_repos = self._extract_affected_repos(content)
+            if affected_repos:
+                result["affected_repos"] = affected_repos
+
+        return result
+
+    def _extract_affected_repos(self, content: str) -> List[Dict[str, str]]:
+        """Extract affected_repos from the output content."""
+        # Try to find JSON block with affected_repos
+        patterns = [
+            r'```json\s*\n?\s*(\{[^`]*"affected_repos"[^`]*\})\s*\n?\s*```',
+            r'(\{[^{}]*"affected_repos"\s*:\s*\[[^\]]*\][^{}]*\})',
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, content, re.DOTALL | re.IGNORECASE)
+            if match:
+                try:
+                    data = json.loads(match.group(1))
+                    repos = data.get("affected_repos", [])
+                    if repos and isinstance(repos, list):
+                        return repos
+                except (json.JSONDecodeError, KeyError):
+                    continue
+
+        return []
