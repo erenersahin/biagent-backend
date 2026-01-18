@@ -12,7 +12,7 @@ import uvicorn
 
 from config import settings
 from db import get_db, close_db
-from api import tickets, pipelines, webhooks, session, worktrees
+from api import tickets, pipelines, webhooks, session, worktrees, waitlist, repos
 from websocket import manager as ws_manager
 from services.jira_sync import start_sync_scheduler, stop_sync_scheduler
 
@@ -48,11 +48,11 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS middleware
+# CORS middleware - allow all origins in development
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173"],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,  # Must be False when using "*"
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -63,6 +63,8 @@ app.include_router(pipelines.router, prefix="/api/pipelines", tags=["pipelines"]
 app.include_router(webhooks.router, prefix="/api/webhooks", tags=["webhooks"])
 app.include_router(session.router, prefix="/api/session", tags=["session"])
 app.include_router(worktrees.router, prefix="/api/worktrees", tags=["worktrees"])
+app.include_router(waitlist.router, prefix="/api/waitlist", tags=["waitlist"])
+app.include_router(repos.router, prefix="/api/repos", tags=["repos"])
 
 # WebSocket endpoint
 app.include_router(ws_manager.router, tags=["websocket"])

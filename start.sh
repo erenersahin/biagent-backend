@@ -51,18 +51,27 @@ fi
 #     echo "  Run 'claude' CLI to authenticate first"
 # fi
 
+# Cross-platform sed in-place edit function
+sed_inplace() {
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        sed -i '' "$@"
+    else
+        sed -i "$@"
+    fi
+}
+
 # Update port to 8888 in .env
 if [ -f "$ENV_FILE" ]; then
     # Update BIAGENT_PORT if it exists, otherwise add it
     if grep -q "^BIAGENT_PORT=" "$ENV_FILE"; then
-        sed -i 's/^BIAGENT_PORT=.*/BIAGENT_PORT=8888/' "$ENV_FILE"
+        sed_inplace 's/^BIAGENT_PORT=.*/BIAGENT_PORT=8888/' "$ENV_FILE"
     else
         echo "BIAGENT_PORT=8888" >> "$ENV_FILE"
     fi
 
     # Ensure host is 0.0.0.0
     if grep -q "^BIAGENT_HOST=" "$ENV_FILE"; then
-        sed -i 's/^BIAGENT_HOST=.*/BIAGENT_HOST=0.0.0.0/' "$ENV_FILE"
+        sed_inplace 's/^BIAGENT_HOST=.*/BIAGENT_HOST=0.0.0.0/' "$ENV_FILE"
     else
         echo "BIAGENT_HOST=0.0.0.0" >> "$ENV_FILE"
     fi

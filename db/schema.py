@@ -359,4 +359,21 @@ CREATE TABLE IF NOT EXISTS worktree_repos (
 CREATE INDEX IF NOT EXISTS idx_worktree_repos_session ON worktree_repos(session_id);
 CREATE INDEX IF NOT EXISTS idx_worktree_repos_branch ON worktree_repos(branch_name);
 CREATE INDEX IF NOT EXISTS idx_worktree_repos_pr ON worktree_repos(pr_url);
+
+-- ============================================================
+-- WAITLIST
+-- ============================================================
+
+-- Waitlist signups
+CREATE TABLE IF NOT EXISTS waitlist (
+    id TEXT PRIMARY KEY,
+    email TEXT NOT NULL UNIQUE,
+    name TEXT,
+    role TEXT,                      -- 'developer', 'lead', 'manager', 'founder', 'other'
+    use_cases TEXT,                 -- JSON array of selected use case IDs
+    created_at TIMESTAMP NOT NULL   -- UTC timestamp from frontend
+);
+
+CREATE INDEX IF NOT EXISTS idx_waitlist_email ON waitlist(email);
+CREATE INDEX IF NOT EXISTS idx_waitlist_created_at ON waitlist(created_at);
 """

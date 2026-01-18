@@ -11,9 +11,7 @@ from typing import Optional, List
 from dataclasses import dataclass
 from enum import Enum
 
-import anthropic
-
-from config import settings
+from claude_agent_sdk import query, ClaudeAgentOptions, AssistantMessage, TextBlock, ResultMessage
 
 
 class Confidence(str, Enum):
@@ -77,7 +75,7 @@ class SetupDetector:
     """Detects setup commands for a repository using AI analysis."""
 
     def __init__(self):
-        self.client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        pass  # Uses claude-agent-sdk, no client needed
 
     async def detect_setup(self, repo_path: Path) -> SetupResult:
         """
@@ -109,17 +107,25 @@ class SetupDetector:
                 reasoning="No setup-related files found in repository"
             )
 
-        # Build prompt for Claude Haiku
+        # Build prompt for Claude
         prompt = self._build_prompt(files_found)
 
         try:
-            response = self.client.messages.create(
-                model="claude-3-5-haiku-20241022",
-                max_tokens=1024,
-                messages=[{"role": "user", "content": prompt}]
+            # Use claude-agent-sdk to query
+            options = ClaudeAgentOptions(
+                cwd=str(repo_path),
+                allowed_tools=[],  # No tools needed for this analysis
+                max_turns=1,
             )
 
-            result = self._parse_response(response.content[0].text, files_checked)
+            full_response = ""
+            async for message in query(prompt=prompt, options=options):
+                if isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if isinstance(block, TextBlock):
+                            full_response += block.text
+
+            result = self._parse_response(full_response, files_checked)
             return result
 
         except Exception as e:

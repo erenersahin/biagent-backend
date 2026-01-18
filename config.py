@@ -35,7 +35,8 @@ class Settings(BaseSettings):
     # GitHub Configuration
     github_token: Optional[str] = None
     github_webhook_secret: Optional[str] = None
-    github_repo: Optional[str] = None  # owner/repo format
+    github_repo: Optional[str] = None  # owner/repo format (legacy single repo)
+    github_org: Optional[str] = None  # Organization name for fetching org repos
 
     # Anthropic Configuration
     anthropic_api_key: Optional[str] = None
