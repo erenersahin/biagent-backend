@@ -156,6 +156,9 @@ class AgentContext:
     user_guidance: Optional[str] = None
     review_comments: Optional[list] = None
     pr: Optional[dict] = None
+    # Worktree isolation fields
+    is_worktree: bool = False  # Whether running in an isolated worktree
+    worktree_paths: Optional[dict] = None  # Map of repo_name -> worktree_path
 
 
 @dataclass

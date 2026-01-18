@@ -45,11 +45,20 @@ PROCESS:
 4. Add labels and reviewers if configured"""
 
     def build_user_prompt(self, context: AgentContext) -> str:
+        # Build worktree-aware path instructions
+        worktree_instructions = ""
+        if context.is_worktree:
+            worktree_instructions = f"""
+IMPORTANT - WORKTREE ISOLATION:
+You are working in an isolated git worktree: {context.codebase_path}
+All git commands should be run from this directory.
+"""
+
         prompt = f"""Please create a pull request for the implementation:
 
 TICKET: {context.ticket_key}
 SUMMARY: {context.ticket['summary']}
-
+{worktree_instructions}
 IMPLEMENTATION (Step 4):
 {context.step_4_output.get('content', '')[:2000] if context.step_4_output else ''}
 
@@ -63,7 +72,7 @@ BRANCH: {context.sandbox_branch}
 CODEBASE: {context.codebase_path}
 
 Please:
-1. Stage all changes
+1. Stage all changes (in {context.codebase_path})
 2. Create a meaningful commit message
 3. Push to remote
 4. Create PR with comprehensive description

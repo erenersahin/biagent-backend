@@ -36,18 +36,29 @@ Provide a structured risk assessment:
 Be direct and specific. Flag anything that could derail implementation."""
 
     def build_user_prompt(self, context: AgentContext) -> str:
+        # Build worktree-aware path instructions
+        worktree_instructions = ""
+        if context.is_worktree:
+            worktree_instructions = f"""
+IMPORTANT - WORKTREE ISOLATION:
+You are working in an isolated git worktree: {context.codebase_path}
+Use this path when examining the codebase, not paths from Step 1 context.
+"""
+
         prompt = f"""Please analyze risks and blockers for implementing this ticket:
 
 TICKET: {context.ticket_key}
 SUMMARY: {context.ticket['summary']}
-
+{worktree_instructions}
 CONTEXT FROM STEP 1:
 {context.step_1_output.get('content', 'No context available') if context.step_1_output else 'No context available'}
+
+CODEBASE: {context.codebase_path}
 
 Please:
 1. Review the ticket requirements and context
 2. Use jira_cli to check for blocking tickets
-3. Examine the codebase for potential conflicts
+3. Examine the codebase for potential conflicts (use relative paths)
 4. Identify all risks and blockers
 5. Suggest mitigations for each risk
 """

@@ -5,8 +5,11 @@ Orchestrates the 8-step agent pipeline for ticket resolution.
 """
 
 import asyncio
+import logging
 from datetime import datetime
 from typing import Optional, List, Dict
+
+logger = logging.getLogger(__name__)
 
 from db import get_db, generate_id, json_dumps, json_loads
 from config import settings, get_step_config, STEP_CONFIGS
@@ -53,6 +56,10 @@ class PipelineEngine:
             return
 
         current_step = pipeline["current_step"]
+
+        # Load existing worktree session if resuming (step > 1)
+        if current_step > 1 and settings.worktree_enabled and not self._worktree_paths:
+            await self._load_existing_worktree_session()
 
         # Broadcast start
         await broadcast_message({
@@ -409,6 +416,24 @@ class PipelineEngine:
             "total_cost": pipeline["total_cost"],
         })
 
+    async def _load_existing_worktree_session(self):
+        """Load existing worktree session for this pipeline if available."""
+        from .worktree_manager import WorktreeManager
+
+        if not self._worktree_manager:
+            self._worktree_manager = WorktreeManager()
+
+        session = await self._worktree_manager.get_session_by_pipeline(self.pipeline_id)
+
+        if session and session.status.value == 'ready':
+            self._worktree_session = session
+            # Populate worktree paths from the session
+            for repo in session.repos:
+                self._worktree_paths[repo.repo_name] = repo.worktree_path
+            logger.info(f"Loaded existing worktree session for pipeline {self.pipeline_id}: {self._worktree_paths}")
+        else:
+            logger.info(f"No ready worktree session found for pipeline {self.pipeline_id}, using main codebase")
+
     async def _setup_worktrees_after_context(self, context_result: dict) -> bool:
         """
         Set up worktrees after Context Agent completes.
@@ -489,47 +514,63 @@ class PipelineEngine:
             })
             return True  # Continue without worktrees
 
-    async def resume_after_user_input(self, setup_commands: Dict[str, List[str]]):
+    async def resume_after_user_input(self):
         """
         Resume pipeline after user provides setup commands.
 
         Called when user provides input for worktree setup.
+        The setup commands have already been processed by WorktreeManager.provide_user_input()
+        before this method is called.
         """
-        if not self._worktree_manager or not self._worktree_session:
+        logger.info(f"[RESUME] resume_after_user_input called for pipeline {self.pipeline_id}")
+
+        if not self._worktree_manager:
             from .worktree_manager import WorktreeManager
             self._worktree_manager = WorktreeManager()
-            self._worktree_session = await self._worktree_manager.get_session_by_pipeline(
-                self.pipeline_id
-            )
 
-        if not self._worktree_session:
-            return
-
-        # Apply user input and run setup
-        setup_result = await self._worktree_manager.provide_user_input(
-            self._worktree_session.id,
-            setup_commands
+        # Reload session to get updated paths after setup
+        logger.info(f"[RESUME] Loading worktree session for pipeline {self.pipeline_id}")
+        self._worktree_session = await self._worktree_manager.get_session_by_pipeline(
+            self.pipeline_id
         )
 
-        if setup_result.success:
-            # Reload session to get updated paths
-            self._worktree_session = await self._worktree_manager.get_session_by_pipeline(
-                self.pipeline_id
-            )
+        if not self._worktree_session:
+            logger.error(f"[RESUME] No worktree session found for pipeline {self.pipeline_id}")
+            return
 
-            # Store worktree paths
+        logger.info(f"[RESUME] Session status: {self._worktree_session.status}, repos: {len(self._worktree_session.repos)}")
+
+        # Check if session is ready (status is an enum but inherits from str)
+        if self._worktree_session.status.value != 'ready':
+            logger.error(f"[RESUME] Worktree session not ready: {self._worktree_session.status}")
+            # Log repo statuses
             for repo in self._worktree_session.repos:
-                self._worktree_paths[repo.repo_name] = repo.worktree_path
+                logger.error(f"[RESUME]   Repo {repo.repo_name}: status={repo.status}, path={repo.worktree_path}")
+            return
 
-            # Update pipeline status and resume
-            db = await self.get_db()
-            await db.execute("""
-                UPDATE pipelines SET status = 'running' WHERE id = ?
-            """, (self.pipeline_id,))
-            await db.commit()
+        # Store worktree paths
+        for repo in self._worktree_session.repos:
+            self._worktree_paths[repo.repo_name] = repo.worktree_path
+            logger.info(f"[RESUME] Worktree path: {repo.repo_name} -> {repo.worktree_path}")
 
-            # Continue pipeline execution
-            await self.run()
+        # Update pipeline status and resume
+        db = await self.get_db()
+        await db.execute("""
+            UPDATE pipelines SET status = 'running' WHERE id = ?
+        """, (self.pipeline_id,))
+        await db.commit()
+        logger.info(f"[RESUME] Updated pipeline status to 'running'")
+
+        # Broadcast that pipeline is resuming
+        await broadcast_message({
+            "type": "pipeline_resumed",
+            "pipeline_id": self.pipeline_id,
+            "step": 2,  # Resume from step 2
+        })
+        logger.info(f"[RESUME] Broadcasted pipeline_resumed, calling run()")
+
+        # Continue pipeline execution
+        await self.run()
 
     async def run_review_step(self, comments: list[dict]):
         """Run the review agent for PR comments."""

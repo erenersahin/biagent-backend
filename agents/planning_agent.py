@@ -42,11 +42,27 @@ Provide a structured implementation plan:
 Be specific enough that the Coding Agent can execute without ambiguity."""
 
     def build_user_prompt(self, context: AgentContext) -> str:
+        # Build worktree-aware path instructions
+        worktree_instructions = ""
+        if context.is_worktree:
+            worktree_instructions = f"""
+IMPORTANT - WORKTREE ISOLATION:
+You are working in an isolated git worktree, NOT the main repository.
+Your working directory is: {context.codebase_path}
+
+When creating the implementation plan:
+- Use RELATIVE PATHS from the codebase root (e.g., "src/api/routes.py" not absolute paths)
+- DO NOT copy absolute paths from Step 1 context - translate them to relative paths
+- All file references should be relative to: {context.codebase_path}
+
+This ensures the Coding Agent will modify files in the correct location.
+"""
+
         prompt = f"""Please create an implementation plan for this ticket:
 
 TICKET: {context.ticket_key}
 SUMMARY: {context.ticket['summary']}
-
+{worktree_instructions}
 CONTEXT FROM STEP 1:
 {context.step_1_output.get('content', 'No context') if context.step_1_output else 'No context'}
 
@@ -60,7 +76,7 @@ Please:
 1. Review the context and risk analysis
 2. Explore the codebase to understand patterns
 3. Design a clear implementation approach
-4. Create detailed, actionable steps
+4. Create detailed, actionable steps (use relative file paths!)
 5. Plan the testing strategy
 """
 

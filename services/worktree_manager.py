@@ -198,20 +198,10 @@ class WorktreeManager:
                 cwd=repo_path
             )
 
-            # Check if branch already exists
-            result = await self._run_command(
-                f"git branch --list {branch_name}",
-                cwd=repo_path
-            )
+            # Prune orphaned worktrees (directories deleted but git still has record)
+            await self._run_command("git worktree prune", cwd=repo_path)
 
-            if result[1].strip():
-                # Branch exists, delete it first (from previous run)
-                await self._run_command(
-                    f"git branch -D {branch_name}",
-                    cwd=repo_path
-                )
-
-            # Check if worktree path already exists
+            # Check if worktree path already exists (registered or physical)
             if worktree_path.exists():
                 # Remove existing worktree
                 await self._run_command(
@@ -221,11 +211,48 @@ class WorktreeManager:
                 if worktree_path.exists():
                     shutil.rmtree(worktree_path)
 
+            # Check if branch already exists (may be left over from pruned worktree)
+            result = await self._run_command(
+                f"git branch --list {branch_name}",
+                cwd=repo_path
+            )
+
+            if result[1].strip():
+                # Branch exists, need to delete it
+                # First check if we're on this branch (can't delete current branch)
+                current_branch_result = await self._run_command(
+                    "git rev-parse --abbrev-ref HEAD",
+                    cwd=repo_path
+                )
+                current_branch = current_branch_result[1].strip()
+
+                if current_branch == branch_name:
+                    # Switch to source branch first before deleting
+                    await self._run_command(
+                        f"git checkout {self.source_branch}",
+                        cwd=repo_path
+                    )
+
+                # Now delete the branch
+                delete_result = await self._run_command(
+                    f"git branch -D {branch_name}",
+                    cwd=repo_path
+                )
+                if not delete_result[0]:
+                    raise RuntimeError(f"Failed to delete existing branch {branch_name}: {delete_result[1]}")
+
             # Create worktree with new branch
-            await self._run_command(
+            success, output = await self._run_command(
                 f"git worktree add -b {branch_name} {worktree_path} origin/{self.source_branch}",
                 cwd=repo_path
             )
+
+            if not success:
+                raise RuntimeError(f"git worktree add failed: {output}")
+
+            # Verify worktree was created successfully (has files)
+            if not worktree_path.exists() or not any(worktree_path.iterdir()):
+                raise RuntimeError(f"Worktree directory empty or missing: {worktree_path}")
 
             # Update status
             await db.execute("""
@@ -269,7 +296,7 @@ class WorktreeManager:
         db = await get_db()
 
         repos = await db.fetchall("""
-            SELECT * FROM worktree_repos WHERE session_id = ?
+            SELECT * FROM worktree_repos WHERE session_id = ? ORDER BY id
         """, (session_id,))
 
         repos_needing_input = []
@@ -357,6 +384,15 @@ class WorktreeManager:
     ) -> bool:
         """Run setup commands for a repo worktree."""
         db = await get_db()
+
+        # Verify worktree directory exists
+        if not repo_path.exists():
+            await db.execute("""
+                UPDATE worktree_repos SET status = ?, setup_output = ? WHERE id = ?
+            """, (WorktreeRepoStatus.FAILED.value, f"Worktree directory does not exist: {repo_path}", repo_id))
+            await db.commit()
+            return False
+
         main_repo_path = Path((await db.fetchone(
             "SELECT repo_path FROM worktree_repos WHERE id = ?", (repo_id,)
         ))["repo_path"])
@@ -429,6 +465,11 @@ class WorktreeManager:
         Returns:
             SetupExecutionResult
         """
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"[WORKTREE] provide_user_input called for session {session_id}")
+        logger.info(f"[WORKTREE] Setup commands: {setup_commands}")
+
         db = await get_db()
 
         # Update session with user response
@@ -442,31 +483,52 @@ class WorktreeManager:
             session_id
         ))
         await db.commit()
+        logger.info(f"[WORKTREE] Updated session status to CREATING")
 
         # Run setup for each repo with provided commands
         repos = await db.fetchall("""
-            SELECT * FROM worktree_repos WHERE session_id = ?
+            SELECT * FROM worktree_repos WHERE session_id = ? ORDER BY id
         """, (session_id,))
+        logger.info(f"[WORKTREE] Found {len(repos)} repos")
 
         all_success = True
 
         for repo in repos:
             repo_name = repo["repo_name"]
             commands = setup_commands.get(repo_name, [])
+            logger.info(f"[WORKTREE] Processing repo {repo_name}: commands={commands}")
+
+            # Skip repos not included in user's commands (user explicitly excluded them)
+            if repo_name not in setup_commands:
+                logger.info(f"[WORKTREE] Skipping repo {repo_name} - not in user's command list")
+                # Mark as ready anyway (user chose to skip)
+                await db.execute("""
+                    UPDATE worktree_repos SET status = ?, setup_output = ? WHERE id = ?
+                """, (WorktreeRepoStatus.READY.value, "Skipped by user", repo["id"]))
+                await db.commit()
+                continue
 
             if not commands:
-                # Use default detection for repos without user input
-                repo_path = Path(repo["worktree_path"])
-                commands = self.setup_detector.get_default_commands(repo_path)
+                # Empty command list means skip setup but still mark as ready
+                logger.info(f"[WORKTREE] Empty commands for {repo_name}, marking as ready")
+                await db.execute("""
+                    UPDATE worktree_repos SET status = ?, setup_output = ? WHERE id = ?
+                """, (WorktreeRepoStatus.READY.value, "No setup commands provided", repo["id"]))
+                await db.commit()
+                continue
 
+            logger.info(f"[WORKTREE] Running setup for {repo_name} at {repo['worktree_path']}")
             success = await self._run_setup_commands(
                 repo["id"],
                 Path(repo["worktree_path"]),
                 commands
             )
+            logger.info(f"[WORKTREE] Setup result for {repo_name}: success={success}")
 
             if not success:
                 all_success = False
+
+        logger.info(f"[WORKTREE] All repos processed, all_success={all_success}")
 
         if all_success:
             now = datetime.utcnow().isoformat()
@@ -474,6 +536,7 @@ class WorktreeManager:
                 UPDATE worktree_sessions SET status = ?, ready_at = ? WHERE id = ?
             """, (WorktreeSessionStatus.READY.value, now, session_id))
             await db.commit()
+            logger.info(f"[WORKTREE] Session status updated to READY")
 
             # Broadcast session ready
             await broadcast_message({
@@ -481,8 +544,13 @@ class WorktreeManager:
                 "pipeline_id": await self._get_pipeline_id(session_id),
                 "repos": [{"name": r["repo_name"], "path": r["worktree_path"]} for r in repos],
             })
+            logger.info(f"[WORKTREE] Broadcasted worktree_session_ready")
+        else:
+            logger.error(f"[WORKTREE] Setup failed for one or more repos")
 
-        return SetupExecutionResult(success=all_success, needs_user_input=False)
+        result = SetupExecutionResult(success=all_success, needs_user_input=False)
+        logger.info(f"[WORKTREE] Returning result: {result}")
+        return result
 
     async def cleanup_session(self, session_id: str, force: bool = False) -> bool:
         """
@@ -505,7 +573,7 @@ class WorktreeManager:
             return False
 
         repos = await db.fetchall("""
-            SELECT * FROM worktree_repos WHERE session_id = ?
+            SELECT * FROM worktree_repos WHERE session_id = ? ORDER BY id
         """, (session_id,))
 
         # Check if all PRs are merged (unless force)
@@ -575,7 +643,7 @@ class WorktreeManager:
             return None
 
         repos = await db.fetchall("""
-            SELECT * FROM worktree_repos WHERE session_id = ?
+            SELECT * FROM worktree_repos WHERE session_id = ? ORDER BY id
         """, (session["id"],))
 
         return WorktreeSession(

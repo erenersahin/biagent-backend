@@ -50,7 +50,7 @@ class Settings(BaseSettings):
 
     # Worktree Configuration
     worktree_enabled: bool = Field(
-        default=False,
+        default=True,
         description="Enable git worktree isolation for pipelines"
     )
     worktree_base_path: str = Field(

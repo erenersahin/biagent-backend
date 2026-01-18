@@ -46,11 +46,28 @@ DO NOT:
 - Ignore type errors or linting issues"""
 
     def build_user_prompt(self, context: AgentContext) -> str:
+        # Build worktree-aware path instructions
+        worktree_instructions = ""
+        if context.is_worktree:
+            worktree_instructions = f"""
+IMPORTANT - WORKTREE ISOLATION:
+You are working in an isolated git worktree, NOT the main repository.
+Your working directory is: {context.codebase_path}
+
+All file operations MUST use paths relative to this working directory or absolute paths starting with {context.codebase_path}.
+
+DO NOT use absolute paths from the context analysis (Step 1) directly - those reference the main repository.
+Instead, translate any referenced files to relative paths from your current working directory.
+
+For example, if Step 1 mentions "/home/eren/Projects/medsien/medsien-api/src/api/routes.py",
+you should access it as "src/api/routes.py" (relative) or "{context.codebase_path}/src/api/routes.py" (absolute).
+"""
+
         prompt = f"""Please implement the code changes for this ticket:
 
 TICKET: {context.ticket_key}
 SUMMARY: {context.ticket['summary']}
-
+{worktree_instructions}
 IMPLEMENTATION PLAN FROM STEP 3:
 {context.step_3_output.get('content', 'No plan') if context.step_3_output else 'No plan'}
 
@@ -65,7 +82,7 @@ BRANCH: {context.sandbox_branch}
 
 Please:
 1. Ensure you're on the sandbox branch: {context.sandbox_branch}
-2. Read the files you need to modify
+2. Read the files you need to modify (use relative paths from {context.codebase_path})
 3. Implement changes according to the plan
 4. Run type checks to verify
 5. Report what was created/modified

@@ -48,13 +48,22 @@ OUTPUT FORMAT:
   Comment: {c.get('comment_body', '')}
 """
 
+        # Build worktree-aware path instructions
+        worktree_instructions = ""
+        if context.is_worktree:
+            worktree_instructions = f"""
+IMPORTANT - WORKTREE ISOLATION:
+You are working in an isolated git worktree: {context.codebase_path}
+All file operations and git commands should use this directory.
+"""
+
         prompt = f"""Please address the following code review comments:
 
 TICKET: {context.ticket_key}
 PR: #{context.pr.get('number', 'N/A') if context.pr else 'N/A'}
 PR URL: {context.pr.get('url', 'N/A') if context.pr else 'N/A'}
 BRANCH: {context.sandbox_branch}
-
+{worktree_instructions}
 REVIEW COMMENTS TO ADDRESS:
 {comments_text or 'No comments'}
 
@@ -62,7 +71,7 @@ CODEBASE: {context.codebase_path}
 
 Please:
 1. Read and understand each comment
-2. Make necessary code changes
+2. Make necessary code changes (use relative paths from {context.codebase_path})
 3. Run tests to verify
 4. Commit and push changes
 5. Reply to each comment on GitHub

@@ -9,7 +9,7 @@ from typing import Optional, Dict, List
 from pydantic import BaseModel
 from datetime import datetime
 
-from db import get_db, generate_id
+from db import get_db, generate_id, json_loads
 from config import settings, get_step_config, get_step_name, STEP_CONFIGS
 from services.pipeline_engine import PipelineEngine
 from services.worktree_manager import WorktreeManager
@@ -35,6 +35,9 @@ class PipelineResponse(BaseModel):
     completed_at: Optional[str] = None
     total_tokens: int
     total_cost: float
+    # Worktree session data (included when status is needs_user_input)
+    worktree_status: Optional[str] = None
+    user_input_request: Optional[Dict] = None
 
 
 class StepResponse(BaseModel):
@@ -137,7 +140,20 @@ async def get_pipeline_by_ticket(ticket_key: str):
     if not pipeline:
         raise HTTPException(status_code=404, detail=f"No pipeline found for ticket {ticket_key}")
 
-    return PipelineResponse(**pipeline)
+    response_data = dict(pipeline)
+
+    # Include worktree session data if pipeline needs user input
+    if pipeline["status"] == "needs_user_input":
+        worktree_session = await db.fetchone(
+            "SELECT status, user_input_request FROM worktree_sessions WHERE pipeline_id = ?",
+            (pipeline["id"],)
+        )
+        if worktree_session:
+            response_data["worktree_status"] = worktree_session["status"]
+            if worktree_session["user_input_request"]:
+                response_data["user_input_request"] = json_loads(worktree_session["user_input_request"])
+
+    return PipelineResponse(**response_data)
 
 
 @router.get("/{pipeline_id}", response_model=PipelineResponse)
@@ -151,7 +167,20 @@ async def get_pipeline(pipeline_id: str):
     if not pipeline:
         raise HTTPException(status_code=404, detail="Pipeline not found")
 
-    return PipelineResponse(**pipeline)
+    response_data = dict(pipeline)
+
+    # Include worktree session data if pipeline needs user input
+    if pipeline["status"] == "needs_user_input":
+        worktree_session = await db.fetchone(
+            "SELECT status, user_input_request FROM worktree_sessions WHERE pipeline_id = ?",
+            (pipeline_id,)
+        )
+        if worktree_session:
+            response_data["worktree_status"] = worktree_session["status"]
+            if worktree_session["user_input_request"]:
+                response_data["user_input_request"] = json_loads(worktree_session["user_input_request"])
+
+    return PipelineResponse(**response_data)
 
 
 @router.get("/{pipeline_id}/steps")
@@ -292,7 +321,7 @@ async def start_pipeline(pipeline_id: str, background_tasks: BackgroundTasks):
     if not pipeline:
         raise HTTPException(status_code=404, detail="Pipeline not found")
 
-    if pipeline["status"] not in ("pending", "paused"):
+    if pipeline["status"] not in ("pending", "paused", "failed"):
         raise HTTPException(
             status_code=400,
             detail=f"Pipeline cannot be started from status: {pipeline['status']}"
@@ -306,10 +335,10 @@ async def start_pipeline(pipeline_id: str, background_tasks: BackgroundTasks):
         WHERE id = ?
     """, (now, pipeline_id))
 
-    # Update first step
+    # Update current step (reset error if retrying from failed)
     await db.execute("""
         UPDATE pipeline_steps
-        SET status = 'running', started_at = ?
+        SET status = 'running', started_at = ?, error_message = NULL
         WHERE pipeline_id = ? AND step_number = ?
     """, (now, pipeline_id, pipeline["current_step"]))
 
@@ -579,13 +608,20 @@ async def provide_pipeline_input(
     Currently supports:
     - input_type="setup_commands": Provide setup commands for worktree repos
     """
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info(f"[PROVIDE-INPUT] Received input for pipeline {pipeline_id}, type={request.input_type}")
+
     db = await get_db()
 
     pipeline = await db.fetchone(
         "SELECT * FROM pipelines WHERE id = ?", (pipeline_id,)
     )
     if not pipeline:
+        logger.error(f"[PROVIDE-INPUT] Pipeline {pipeline_id} not found")
         raise HTTPException(status_code=404, detail="Pipeline not found")
+
+    logger.info(f"[PROVIDE-INPUT] Pipeline status: {pipeline['status']}")
 
     if pipeline["status"] != "needs_user_input":
         raise HTTPException(
@@ -606,30 +642,49 @@ async def provide_pipeline_input(
             (pipeline_id,)
         )
         if not session:
+            logger.error(f"[PROVIDE-INPUT] No worktree session found for pipeline {pipeline_id}")
             raise HTTPException(
                 status_code=404,
                 detail="No worktree session found for this pipeline"
             )
 
-        # Provide the user input and run setup
-        manager = WorktreeManager()
-        try:
-            await manager.provide_user_input(session["id"], request.data)
-        except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to process setup commands: {str(e)}"
-            )
+        logger.info(f"[PROVIDE-INPUT] Found worktree session {session['id']}, status={session['status']}")
+        logger.info(f"[PROVIDE-INPUT] Setup commands: {request.data}")
 
-        # Resume the pipeline execution
-        engine = PipelineEngine(pipeline_id)
-        background_tasks.add_task(engine.resume_after_user_input)
+        # Run setup and resume pipeline in background (don't block HTTP response)
+        async def run_setup_and_resume():
+            import logging
+            bg_logger = logging.getLogger(__name__)
+            try:
+                bg_logger.info(f"[PROVIDE-INPUT-BG] Starting setup for session {session['id']}")
+                manager = WorktreeManager()
+                result = await manager.provide_user_input(session["id"], request.data)
+                bg_logger.info(f"[PROVIDE-INPUT-BG] Setup result: {result}")
+
+                if result.success:
+                    bg_logger.info(f"[PROVIDE-INPUT-BG] Setup succeeded, resuming pipeline")
+                    engine = PipelineEngine(pipeline_id)
+                    await engine.resume_after_user_input()
+                else:
+                    bg_logger.error(f"[PROVIDE-INPUT-BG] Setup failed, not resuming pipeline")
+                    # Broadcast failure
+                    from websocket.manager import broadcast_message
+                    await broadcast_message({
+                        "type": "worktree_setup_failed",
+                        "pipeline_id": pipeline_id,
+                        "message": "Setup commands failed. Check logs for details."
+                    })
+            except Exception as e:
+                bg_logger.exception(f"[PROVIDE-INPUT-BG] Error: {e}")
+
+        background_tasks.add_task(run_setup_and_resume)
+        logger.info(f"[PROVIDE-INPUT] Added setup task to background, returning immediately")
 
         return {
             "status": "input_received",
             "pipeline_id": pipeline_id,
             "input_type": request.input_type,
-            "message": "Setup commands received. Pipeline will resume."
+            "message": "Setup commands received. Running setup in background..."
         }
 
     else:

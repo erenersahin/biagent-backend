@@ -45,11 +45,20 @@ OUTPUT FORMAT:
 - Issues found and fixed"""
 
     def build_user_prompt(self, context: AgentContext) -> str:
+        # Build worktree-aware path instructions
+        worktree_instructions = ""
+        if context.is_worktree:
+            worktree_instructions = f"""
+IMPORTANT - WORKTREE ISOLATION:
+You are working in an isolated git worktree: {context.codebase_path}
+Use relative paths for all file operations, not absolute paths from earlier step outputs.
+"""
+
         prompt = f"""Please write and execute tests for the implementation:
 
 TICKET: {context.ticket_key}
 SUMMARY: {context.ticket['summary']}
-
+{worktree_instructions}
 IMPLEMENTATION FROM STEP 4:
 {context.step_4_output.get('content', 'No implementation')[:3000] if context.step_4_output else 'No implementation'}
 
@@ -65,7 +74,7 @@ BRANCH: {context.sandbox_branch}
 Please:
 1. Review the implementation changes
 2. Identify what needs to be tested
-3. Write comprehensive tests
+3. Write comprehensive tests (use relative file paths)
 4. Run the tests
 5. Fix any failing tests
 6. Report results

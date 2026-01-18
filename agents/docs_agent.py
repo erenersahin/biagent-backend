@@ -38,11 +38,20 @@ OUTPUT FORMAT:
 - Suggested follow-up documentation tasks"""
 
     def build_user_prompt(self, context: AgentContext) -> str:
+        # Build worktree-aware path instructions
+        worktree_instructions = ""
+        if context.is_worktree:
+            worktree_instructions = f"""
+IMPORTANT - WORKTREE ISOLATION:
+You are working in an isolated git worktree: {context.codebase_path}
+Use relative paths for all file operations.
+"""
+
         prompt = f"""Please update documentation for the implementation:
 
 TICKET: {context.ticket_key}
 SUMMARY: {context.ticket['summary']}
-
+{worktree_instructions}
 IMPLEMENTATION SUMMARY (Step 4):
 {context.step_4_output.get('content', '')[:2000] if context.step_4_output else 'No summary'}
 
@@ -54,7 +63,7 @@ CODEBASE: {context.codebase_path}
 Please:
 1. Review the changes made
 2. Identify documentation that needs updates
-3. Update relevant documentation files
+3. Update relevant documentation files (use relative paths)
 4. Ensure examples are accurate
 5. Report what was updated
 """

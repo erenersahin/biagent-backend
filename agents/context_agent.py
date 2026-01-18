@@ -45,21 +45,28 @@ Your output should be a comprehensive context summary that includes:
             base_prompt += """
 
 IMPORTANT - AFFECTED REPOSITORIES:
-The codebase may contain multiple git repositories. You must analyze which repositories
-need to be modified to implement this ticket.
+The codebase path contains MULTIPLE git repositories (e.g., frontend, backend, shared libs).
+You MUST explore the codebase to find all repositories and determine which ones are affected.
+
+Steps:
+1. First, list the directories in the codebase path to discover all repositories
+2. Identify which repos are relevant based on the ticket (e.g., "Frontend" tickets → frontend repo)
+3. The PRIMARY affected repo should be listed FIRST in the array
 
 At the END of your output, include a JSON block with the affected repos:
 
 ```json
 {
   "affected_repos": [
-    {"name": "repo-name-1", "reason": "Brief reason why this repo is affected"},
-    {"name": "repo-name-2", "reason": "Brief reason why this repo is affected"}
+    {"name": "primary-repo-name", "reason": "PRIMARY - Main repo for this ticket"},
+    {"name": "secondary-repo-name", "reason": "Secondary - May need minor changes"}
   ]
 }
 ```
 
-If you cannot determine affected repos from the ticket, list all repos you find in the codebase path."""
+If the ticket mentions "Frontend", "UI", "React", "Web" → the primary repo is likely a frontend repo.
+If the ticket mentions "API", "Backend", "Django", "Database" → the primary repo is likely a backend repo.
+If you cannot determine affected repos, list all repos you find."""
 
         base_prompt += """
 
