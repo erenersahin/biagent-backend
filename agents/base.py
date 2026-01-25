@@ -6,6 +6,8 @@ Supports subagents, sessions, custom tools, and comprehensive error handling.
 """
 
 import asyncio
+import json
+import re
 from typing import Optional, Callable, Any
 from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
@@ -145,6 +147,7 @@ class AgentContext:
     ticket: dict
     codebase_path: str
     sandbox_branch: str
+    step_id: Optional[str] = None  # Current step ID for clarification requests
     step_1_output: Optional[dict] = None
     step_2_output: Optional[dict] = None
     step_3_output: Optional[dict] = None
@@ -154,11 +157,20 @@ class AgentContext:
     step_7_output: Optional[dict] = None
     user_feedback: Optional[str] = None
     user_guidance: Optional[str] = None
+    clarification_answer: Optional[str] = None  # Answer to a previous clarification
     review_comments: Optional[list] = None
     pr: Optional[dict] = None
     # Worktree isolation fields
     is_worktree: bool = False  # Whether running in an isolated worktree
     worktree_paths: Optional[dict] = None  # Map of repo_name -> worktree_path
+
+
+@dataclass
+class ClarificationRequest:
+    """A request for user clarification from an agent."""
+    question: str
+    options: list[str]
+    context: str = ""
 
 
 @dataclass
@@ -171,6 +183,65 @@ class AgentResult:
     files_created: list = field(default_factory=list)
     files_modified: list = field(default_factory=list)
     commit_sha: Optional[str] = None
+    clarification_request: Optional[ClarificationRequest] = None  # If agent needs user input
+
+
+# Clarification instruction to append to agent prompts
+CLARIFICATION_INSTRUCTION = """
+## REQUESTING CLARIFICATION
+
+If you encounter any of these situations, you MUST request clarification before proceeding:
+- Ambiguous requirements that could be interpreted multiple ways
+- Missing critical information needed to proceed
+- Multiple valid implementation approaches where user preference matters
+- Potential breaking changes that need explicit approval
+- Security or data handling decisions that require user input
+
+To request clarification, output a JSON block with this EXACT format:
+
+```clarification
+{
+  "question": "Your clear, specific question",
+  "options": ["Option 1", "Option 2", "Option 3"],
+  "context": "Why you're asking and what impact each option has"
+}
+```
+
+IMPORTANT:
+- Use 2-4 options that cover the reasonable choices
+- The question must be specific and actionable
+- After outputting the clarification request, STOP and wait - do not continue with implementation
+"""
+
+
+def parse_clarification_request(content: str) -> Optional[ClarificationRequest]:
+    """Parse a clarification request from agent output.
+
+    Looks for a ```clarification code block with JSON content.
+    """
+    # Look for clarification code block
+    pattern = r'```clarification\s*([\s\S]*?)\s*```'
+    match = re.search(pattern, content)
+
+    if not match:
+        return None
+
+    try:
+        data = json.loads(match.group(1))
+        question = data.get("question", "")
+        options = data.get("options", [])
+        context = data.get("context", "")
+
+        if question and options and len(options) >= 2:
+            return ClarificationRequest(
+                question=question,
+                options=options[:4],  # Max 4 options
+                context=context
+            )
+    except (json.JSONDecodeError, KeyError, TypeError):
+        pass
+
+    return None
 
 
 class BaseAgent(ABC):
@@ -182,6 +253,7 @@ class BaseAgent(ABC):
     - Custom tools via MCP servers
     - Comprehensive error handling
     - Configurable cost tracking
+    - Clarification requests for ambiguous situations
     """
 
     # Map of tool names to SDK tool names
@@ -194,6 +266,9 @@ class BaseAgent(ABC):
         "jira_cli": "Bash",
         "github_cli": "Bash",
     }
+
+    # Whether this agent type can request clarifications
+    CAN_REQUEST_CLARIFICATION = True
 
     def __init__(
         self,
@@ -219,12 +294,17 @@ class BaseAgent(ABC):
 
     def get_agent_options(self, context: AgentContext) -> ClaudeAgentOptions:
         """Build ClaudeAgentOptions for this agent."""
+        # Build system prompt with clarification instruction if enabled
+        system_prompt = self.system_prompt
+        if self.CAN_REQUEST_CLARIFICATION:
+            system_prompt += "\n\n" + CLARIFICATION_INSTRUCTION
+
         return ClaudeAgentOptions(
             cwd=context.codebase_path,
             allowed_tools=self.get_allowed_tools(),
             permission_mode="acceptEdits",
             max_turns=50,
-            system_prompt=self.system_prompt,
+            system_prompt=system_prompt,
         )
 
     @property
@@ -242,19 +322,30 @@ class BaseAgent(ABC):
         self,
         context: AgentContext,
         on_token: Optional[Callable[[str], Any]] = None,
-        on_tool_call: Optional[Callable[[str, dict], Any]] = None,
+        on_tool_call: Optional[Callable[[str, dict, str], Any]] = None,
     ) -> dict:
         """Execute the agent with streaming using Claude Agent SDK.
 
         Args:
             context: The agent context with ticket and pipeline info
             on_token: Callback for streaming text tokens
-            on_tool_call: Callback for tool invocations
+            on_tool_call: Callback for tool invocations (tool_name, args, tool_use_id)
 
         Returns:
             dict with content, structured_output, tokens_used, and cost
         """
         user_prompt = self.build_user_prompt(context)
+
+        # Prepend clarification answer if resuming from a clarification
+        if context.clarification_answer:
+            user_prompt = (
+                f"## CLARIFICATION RESPONSE\n\n"
+                f"You previously asked for clarification. The user's answer is:\n"
+                f"**{context.clarification_answer}**\n\n"
+                f"Please continue with your task using this information.\n\n"
+                f"---\n\n{user_prompt}"
+            )
+
         options = self.get_agent_options(context)
 
         tracker = CostTracker(self.cost_config)
@@ -274,7 +365,7 @@ class BaseAgent(ABC):
 
                         elif isinstance(block, ToolUseBlock):
                             if on_tool_call:
-                                result = on_tool_call(block.name, block.input or {})
+                                result = on_tool_call(block.name, block.input or {}, block.id)
                                 if asyncio.iscoroutine(result):
                                     await result
 
@@ -309,11 +400,25 @@ class BaseAgent(ABC):
         # Calculate cost if not provided
         tracker.calculate_cost()
 
-        return {
+        # Check for clarification request in response
+        clarification = None
+        if self.CAN_REQUEST_CLARIFICATION:
+            clarification = parse_clarification_request(full_response)
+
+        result = {
             "content": full_response,
             "structured_output": self.parse_output(full_response),
             **tracker.get_result(),
         }
+
+        if clarification:
+            result["clarification_request"] = {
+                "question": clarification.question,
+                "options": clarification.options,
+                "context": clarification.context,
+            }
+
+        return result
 
     def parse_output(self, content: str) -> Optional[dict]:
         """Parse structured output from response. Override in subclasses."""

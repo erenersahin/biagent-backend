@@ -2,6 +2,7 @@
 Pipeline Execution Engine
 
 Orchestrates the 8-step agent pipeline for ticket resolution.
+Uses PipelineSession for persistent context across all steps.
 """
 
 import asyncio
@@ -14,29 +15,38 @@ logger = logging.getLogger(__name__)
 from db import get_db, generate_id, json_dumps, json_loads
 from config import settings, get_step_config, STEP_CONFIGS
 from websocket.manager import broadcast_message
-from agents import create_agent, AgentContext
+from agents import create_agent, AgentContext, PipelineSession
+from . import session_store
 
 # Get max steps from config
 MAX_STEPS = settings.max_steps
 
 
 class PipelineEngine:
-    """Engine for executing pipelines."""
+    """Engine for executing pipelines using PipelineSession.
+
+    Uses a persistent ClaudeSDKClient session across all steps,
+    enabling context persistence where Claude remembers everything
+    from previous steps.
+    """
 
     def __init__(
         self,
         pipeline_id: str,
         feedback: Optional[str] = None,
         guidance: Optional[str] = None,
+        clarification_answer: Optional[str] = None,
     ):
         self.pipeline_id = pipeline_id
         self.feedback = feedback
         self.guidance = guidance
+        self.clarification_answer = clarification_answer  # Answer to a clarification request
         self._db = None
         self._step_events: dict[int, list] = {}  # Track events per step for chronological storage
         self._worktree_manager = None  # Initialized if worktrees enabled
         self._worktree_session = None  # Current worktree session
         self._worktree_paths: Dict[str, str] = {}  # repo_name -> worktree_path mapping
+        self._session: Optional[PipelineSession] = None  # Persistent Claude session
 
     async def get_db(self):
         """Get database connection."""
@@ -45,7 +55,7 @@ class PipelineEngine:
         return self._db
 
     async def run(self):
-        """Run the pipeline from current step."""
+        """Run the pipeline from current step with persistent session."""
         db = await self.get_db()
 
         # Get pipeline
@@ -61,6 +71,17 @@ class PipelineEngine:
         if current_step > 1 and settings.worktree_enabled and not self._worktree_paths:
             await self._load_existing_worktree_session()
 
+        # Create or restore PipelineSession
+        try:
+            if current_step == 1:
+                self._session = await self._create_new_session(pipeline)
+            else:
+                self._session = await self._restore_session(pipeline)
+        except Exception as e:
+            logger.error(f"Failed to create/restore session: {e}")
+            # Fall back to stateless execution if session creation fails
+            self._session = None
+
         # Broadcast start
         await broadcast_message({
             "type": "pipeline_started" if current_step == 1 else "pipeline_resumed",
@@ -68,39 +89,53 @@ class PipelineEngine:
             "ticket_key": pipeline["ticket_key"],
         })
 
-        # Execute steps sequentially (up to MAX_STEPS)
-        while current_step <= MAX_STEPS:
-            # Check for pause request
-            pipeline = await db.fetchone(
-                "SELECT pause_requested, status FROM pipelines WHERE id = ?",
-                (self.pipeline_id,)
-            )
+        try:
+            # Execute steps sequentially (up to MAX_STEPS)
+            while current_step <= MAX_STEPS:
+                # Check for pause request
+                pipeline = await db.fetchone(
+                    "SELECT pause_requested, status FROM pipelines WHERE id = ?",
+                    (self.pipeline_id,)
+                )
 
-            if pipeline["pause_requested"]:
-                await self._pause_pipeline(current_step)
-                return
+                if pipeline["pause_requested"]:
+                    await self._pause_pipeline(current_step)
+                    return
 
-            if pipeline["status"] not in ("running",):
-                return
+                if pipeline["status"] not in ("running",):
+                    return
 
-            # Execute step
-            success = await self._execute_step(current_step)
+                # Execute step
+                success = await self._execute_step(current_step)
 
-            if not success:
-                # Step failed
-                return
+                if not success:
+                    # Step failed
+                    return
 
-            # Move to next step
-            current_step += 1
+                # Update session progress after successful step
+                if self._session:
+                    await session_store.update_session_progress(
+                        self.pipeline_id,
+                        current_step,
+                    )
 
-            if current_step <= MAX_STEPS:
-                await self._transition_to_step(current_step)
+                # Move to next step
+                current_step += 1
 
-        # Pipeline complete
-        await self._complete_pipeline()
+                if current_step <= MAX_STEPS:
+                    await self._transition_to_step(current_step)
+
+            # Pipeline complete
+            await self._complete_pipeline()
+
+        finally:
+            # Clean up session on completion or error
+            if self._session:
+                await self._session.close()
+                self._session = None
 
     async def _execute_step(self, step_number: int) -> bool:
-        """Execute a single step."""
+        """Execute a single step using PipelineSession when available."""
         db = await self.get_db()
         config = get_step_config(step_number)
 
@@ -126,6 +161,7 @@ class PipelineEngine:
         try:
             # Build agent context
             context = await self._build_agent_context(step_number)
+            context["step_id"] = step["id"]  # Pass step_id for clarification tracking
 
             # Add feedback if provided
             if self.feedback and step_number == (await db.fetchone(
@@ -139,7 +175,12 @@ class PipelineEngine:
                 context["user_guidance"] = self.guidance
                 self.guidance = None
 
-            # Create and run agent
+            # Add clarification answer if resuming from a clarification
+            if self.clarification_answer:
+                context["clarification_answer"] = self.clarification_answer
+                self.clarification_answer = None  # Clear after use
+
+            # Create agent (used for prompts and parsing)
             agent = create_agent(
                 agent_type=config["agent_type"],
                 model=config["model"],
@@ -147,12 +188,47 @@ class PipelineEngine:
                 tools=config["tools"],
             )
 
-            # Execute with streaming
-            result = await agent.execute(
-                context=AgentContext(**context),
-                on_token=lambda token: self._stream_token(step_number, token),
-                on_tool_call=lambda tool, args, sn=step_number, sid=step["id"]: self._log_tool_call(sid, sn, tool, args),
-            )
+            # Execute step - use PipelineSession if available for context persistence
+            if self._session:
+                # Use persistent session - Claude remembers all previous steps
+                step_result = await self._session.execute_step(
+                    step_number=step_number,
+                    agent=agent,
+                    context=AgentContext(**context),
+                    on_token=lambda token: self._stream_token(step_number, token),
+                    on_tool_call=lambda tool, args, tool_use_id, sn=step_number, sid=step["id"]: self._log_tool_call(sid, sn, tool, args, tool_use_id),
+                    on_subagent_tool_call=lambda parent_id, tool, tool_id, args, sn=step_number, sid=step["id"]: self._log_subagent_tool_call(sid, sn, parent_id, tool, tool_id, args),
+                )
+                result = {
+                    "content": step_result.content,
+                    "structured_output": step_result.structured_output,
+                    "tokens_used": step_result.tokens_used,
+                    "cost": step_result.cost,
+                }
+
+                # Check if step was interrupted
+                if step_result.was_interrupted:
+                    await self._pause_pipeline(step_number)
+                    return False
+
+                # Check for clarification request
+                if step_result.clarification_request:
+                    return await self._handle_clarification(
+                        step, step_number, step_result.clarification_request
+                    )
+            else:
+                # Fallback to stateless execution (legacy behavior)
+                result = await agent.execute(
+                    context=AgentContext(**context),
+                    on_token=lambda token: self._stream_token(step_number, token),
+                    on_tool_call=lambda tool, args, tool_use_id, sn=step_number, sid=step["id"]: self._log_tool_call(sid, sn, tool, args, tool_use_id),
+                )
+
+                # Check for clarification request in stateless result
+                if result.get("clarification_request"):
+                    return await self._handle_clarification(
+                        step, step_number, result["clarification_request"]
+                    )
 
             # Save output with chronological events
             output_id = generate_id()
@@ -208,6 +284,26 @@ class PipelineEngine:
                 worktree_ready = await self._setup_worktrees_after_context(result)
                 if not worktree_ready:
                     # Pipeline is waiting for user input
+                    return False
+
+            # After step 7 (PR Agent), broadcast waiting_for_review if there's a next step
+            if step_number == 7 and step_number < MAX_STEPS:
+                # Get PR info if it was created
+                pr = await db.fetchone("""
+                    SELECT pr_number, pr_url FROM pull_requests WHERE pipeline_id = ?
+                """, (self.pipeline_id,))
+                if pr:
+                    await db.execute("""
+                        UPDATE pipelines SET status = 'waiting_for_review' WHERE id = ?
+                    """, (self.pipeline_id,))
+                    await db.commit()
+                    await broadcast_message({
+                        "type": "waiting_for_review",
+                        "pipeline_id": self.pipeline_id,
+                        "pr_number": pr["pr_number"],
+                        "pr_url": pr["pr_url"],
+                    })
+                    # Return False to stop automatic progression - wait for review webhook
                     return False
 
             return True
@@ -298,6 +394,118 @@ class PipelineEngine:
 
         return context
 
+    async def _create_new_session(self, pipeline: dict) -> PipelineSession:
+        """Create a new PipelineSession for a fresh pipeline.
+
+        This initializes a persistent ClaudeSDKClient session that will
+        maintain context across all pipeline steps.
+        """
+        db = await self.get_db()
+
+        ticket = await db.fetchone(
+            "SELECT * FROM tickets WHERE key = ?",
+            (pipeline["ticket_key"],)
+        )
+
+        # Determine codebase path - use worktree if available
+        codebase_path = settings.codebase_path
+        if settings.worktree_enabled and self._worktree_paths:
+            first_repo = list(self._worktree_paths.keys())[0]
+            codebase_path = self._worktree_paths[first_repo]
+
+        ticket_context = {
+            "key": ticket["key"],
+            "summary": ticket["summary"],
+            "description": ticket["description"],
+        }
+
+        session = PipelineSession(
+            pipeline_id=self.pipeline_id,
+            codebase_path=codebase_path,
+            ticket_context=ticket_context,
+        )
+
+        session_id = await session.start()
+        logger.info(f"Created new PipelineSession {session_id} for pipeline {self.pipeline_id}")
+
+        # Save session to database
+        await session_store.save_session(
+            pipeline_id=self.pipeline_id,
+            session_id=session_id,
+            cwd=codebase_path,
+            ticket_context=ticket_context,
+        )
+
+        return session
+
+    async def _restore_session(self, pipeline: dict) -> PipelineSession:
+        """Restore an existing session for a resumed pipeline.
+
+        Since we can't truly restore ClaudeSDKClient's internal state,
+        this creates a new session and injects a summary of previous
+        work to provide context continuity.
+        """
+        db = await self.get_db()
+
+        # Try to get existing session info
+        existing_session = await session_store.get_session(self.pipeline_id)
+
+        ticket = await db.fetchone(
+            "SELECT * FROM tickets WHERE key = ?",
+            (pipeline["ticket_key"],)
+        )
+
+        # Determine codebase path
+        codebase_path = settings.codebase_path
+        if settings.worktree_enabled and self._worktree_paths:
+            first_repo = list(self._worktree_paths.keys())[0]
+            codebase_path = self._worktree_paths[first_repo]
+
+        ticket_context = {
+            "key": ticket["key"],
+            "summary": ticket["summary"],
+            "description": ticket["description"],
+        }
+
+        # Generate summary of previous work for context injection
+        conversation_summary = None
+        if existing_session:
+            conversation_summary = existing_session.get('conversation_summary')
+
+        if not conversation_summary:
+            # Generate summary from step outputs
+            conversation_summary = await session_store.generate_conversation_summary(
+                self.pipeline_id
+            )
+
+        # Create restored session with context
+        session = await PipelineSession.restore(
+            session_id=existing_session.get('claude_session_id', '') if existing_session else '',
+            pipeline_id=self.pipeline_id,
+            codebase_path=codebase_path,
+            ticket_context=ticket_context,
+            conversation_summary=conversation_summary,
+        )
+
+        logger.info(f"Restored PipelineSession for pipeline {self.pipeline_id}")
+
+        # Update session in database
+        if existing_session:
+            await session_store.update_session_progress(
+                self.pipeline_id,
+                pipeline["current_step"] - 1,
+            )
+        else:
+            await session_store.save_session(
+                pipeline_id=self.pipeline_id,
+                session_id=session.session_id or '',
+                cwd=codebase_path,
+                ticket_context=ticket_context,
+                last_step_completed=pipeline["current_step"] - 1,
+            )
+
+        return session
+
     async def _stream_token(self, step_number: int, token: str):
         """Stream token to clients and track for chronological storage."""
         # Track event for saving later
@@ -320,7 +528,7 @@ class PipelineEngine:
             "token": token,
         })
 
-    async def _log_tool_call(self, step_id: str, step_number: int, tool: str, args: dict):
+    async def _log_tool_call(self, step_id: str, step_number: int, tool: str, args: dict, tool_use_id: str = None):
         """Log tool call to database and track for chronological storage."""
         db = await self.get_db()
         now = datetime.utcnow().isoformat()
@@ -331,15 +539,16 @@ class PipelineEngine:
         self._step_events[step_number].append({
             "type": "tool_call",
             "tool": tool,
+            "tool_use_id": tool_use_id,
             "arguments": args,
             "timestamp": now,
         })
 
         tool_call_id = generate_id()
         await db.execute("""
-            INSERT INTO tool_calls (id, step_id, tool_name, arguments, created_at)
-            VALUES (?, ?, ?, ?, ?)
-        """, (tool_call_id, step_id, tool, json_dumps(args), datetime.utcnow().isoformat()))
+            INSERT INTO tool_calls (id, step_id, tool_name, tool_use_id, arguments, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (tool_call_id, step_id, tool, tool_use_id, json_dumps(args), datetime.utcnow().isoformat()))
         await db.commit()
 
         await broadcast_message({
@@ -347,7 +556,52 @@ class PipelineEngine:
             "pipeline_id": self.pipeline_id,
             "step": step_number,
             "tool": tool,
+            "tool_use_id": tool_use_id,
             "arguments": args,
+        })
+
+    async def _log_subagent_tool_call(
+        self,
+        step_id: str,
+        step_number: int,
+        parent_tool_use_id: str,
+        tool_name: str,
+        tool_use_id: str,
+        arguments: dict,
+    ):
+        """Log subagent tool call and broadcast in real-time."""
+        db = await self.get_db()
+        now = datetime.utcnow().isoformat()
+
+        # Save to database
+        subagent_tc_id = generate_id()
+        await db.execute("""
+            INSERT INTO subagent_tool_calls
+            (id, pipeline_id, step_id, step_number, parent_tool_use_id, tool_use_id, tool_name, arguments, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            subagent_tc_id,
+            self.pipeline_id,
+            step_id,
+            step_number,
+            parent_tool_use_id,
+            tool_use_id,
+            tool_name,
+            json_dumps(arguments),
+            now,
+        ))
+        await db.commit()
+
+        # Broadcast REAL-TIME to frontend
+        await broadcast_message({
+            "type": "subagent_tool_call",
+            "pipeline_id": self.pipeline_id,
+            "step": step_number,
+            "parent_tool_use_id": parent_tool_use_id,
+            "tool_use_id": tool_use_id,
+            "tool_name": tool_name,
+            "arguments": arguments,
+            "timestamp": now,
         })
 
     async def _transition_to_step(self, step_number: int):
@@ -368,7 +622,7 @@ class PipelineEngine:
         await db.commit()
 
     async def _pause_pipeline(self, current_step: int):
-        """Pause the pipeline."""
+        """Pause the pipeline and save session state."""
         db = await self.get_db()
         now = datetime.utcnow().isoformat()
 
@@ -386,14 +640,95 @@ class PipelineEngine:
 
         await db.commit()
 
+        # Generate and save conversation summary for later restoration
+        if self._session:
+            conversation_summary = await session_store.generate_conversation_summary(
+                self.pipeline_id
+            )
+            await session_store.pause_session(
+                self.pipeline_id,
+                conversation_summary=conversation_summary,
+            )
+
         await broadcast_message({
             "type": "pipeline_paused",
             "pipeline_id": self.pipeline_id,
             "step": current_step,
         })
 
+    async def _handle_clarification(
+        self,
+        step: dict,
+        step_number: int,
+        clarification_request: dict
+    ) -> bool:
+        """Handle a clarification request from an agent.
+
+        Creates a clarification record and pauses the pipeline waiting for user input.
+        Returns False to stop pipeline execution.
+        """
+        db = await self.get_db()
+        now = datetime.utcnow().isoformat()
+
+        # Create clarification record
+        clarification_id = generate_id()
+        await db.execute("""
+            INSERT INTO clarifications
+            (id, step_id, pipeline_id, question, options, context, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+        """, (
+            clarification_id,
+            step["id"],
+            self.pipeline_id,
+            clarification_request.get("question", ""),
+            json_dumps(clarification_request.get("options", [])),
+            clarification_request.get("context", ""),
+            now,
+        ))
+
+        # Update step to waiting state
+        await db.execute("""
+            UPDATE pipeline_steps
+            SET status = 'waiting', waiting_for = 'clarification'
+            WHERE id = ?
+        """, (step["id"],))
+
+        # Update pipeline status
+        await db.execute("""
+            UPDATE pipelines
+            SET status = 'needs_user_input'
+            WHERE id = ?
+        """, (self.pipeline_id,))
+
+        await db.commit()
+
+        # Get ticket key for the broadcast
+        pipeline = await db.fetchone(
+            "SELECT ticket_key FROM pipelines WHERE id = ?",
+            (self.pipeline_id,)
+        )
+
+        # Broadcast clarification request to clients
+        await broadcast_message({
+            "type": "clarification_requested",
+            "pipeline_id": self.pipeline_id,
+            "ticket_key": pipeline["ticket_key"],
+            "step": step_number,
+            "clarification_id": clarification_id,
+            "question": clarification_request.get("question", ""),
+            "options": clarification_request.get("options", []),
+            "context": clarification_request.get("context", ""),
+        })
+
+        logger.info(
+            f"Pipeline {self.pipeline_id} paused for clarification at step {step_number}: "
+            f"{clarification_request.get('question', '')}"
+        )
+
+        return False  # Stop pipeline execution
+
     async def _complete_pipeline(self):
-        """Mark pipeline as complete."""
+        """Mark pipeline as complete and close session."""
         db = await self.get_db()
         now = datetime.utcnow().isoformat()
 
@@ -408,6 +743,9 @@ class PipelineEngine:
         """, (now, self.pipeline_id))
 
         await db.commit()
+
+        # Mark session as completed
+        await session_store.complete_session(self.pipeline_id)
 
         await broadcast_message({
             "type": "pipeline_completed",
@@ -573,8 +911,9 @@ class PipelineEngine:
         await self.run()
 
     async def run_review_step(self, comments: list[dict]):
-        """Run the review agent for PR comments."""
+        """Run the review agent for PR comments using PipelineSession if available."""
         db = await self.get_db()
+        step_number = 8
 
         # Get step 8
         step = await db.fetchone("""
@@ -599,8 +938,20 @@ class PipelineEngine:
 
         await db.commit()
 
+        # Try to restore session for review step
+        if not self._session:
+            try:
+                pipeline = await db.fetchone(
+                    "SELECT * FROM pipelines WHERE id = ?",
+                    (self.pipeline_id,)
+                )
+                self._session = await self._restore_session(pipeline)
+            except Exception as e:
+                logger.warning(f"Could not restore session for review step: {e}")
+                self._session = None
+
         # Build context with comments
-        context = await self._build_agent_context(8)
+        context = await self._build_agent_context(step_number)
         context["review_comments"] = comments
 
         # Get PR info
@@ -616,7 +967,7 @@ class PipelineEngine:
             }
 
         # Execute review agent
-        config = get_step_config(8)
+        config = get_step_config(step_number)
         agent = create_agent(
             agent_type=config["agent_type"],
             model=config["model"],
@@ -625,11 +976,29 @@ class PipelineEngine:
         )
 
         try:
-            result = await agent.execute(
-                context=AgentContext(**context),
-                on_token=lambda token: self._stream_token(8, token),
-                on_tool_call=lambda tool, args, sn=step_number, sid=step["id"]: self._log_tool_call(sid, sn, tool, args),
-            )
+            # Use PipelineSession if available for context persistence
+            if self._session:
+                step_result = await self._session.execute_step(
+                    step_number=step_number,
+                    agent=agent,
+                    context=AgentContext(**context),
+                    on_token=lambda token: self._stream_token(step_number, token),
+                    on_tool_call=lambda tool, args, tool_use_id, sn=step_number, sid=step["id"]: self._log_tool_call(sid, sn, tool, args, tool_use_id),
+                    on_subagent_tool_call=lambda parent_id, tool, tool_id, args, sn=step_number, sid=step["id"]: self._log_subagent_tool_call(sid, sn, parent_id, tool, tool_id, args),
+                )
+                result = {
+                    "content": step_result.content,
+                    "structured_output": step_result.structured_output,
+                    "tokens_used": step_result.tokens_used,
+                    "cost": step_result.cost,
+                }
+            else:
+                # Fallback to stateless execution
+                result = await agent.execute(
+                    context=AgentContext(**context),
+                    on_token=lambda token: self._stream_token(step_number, token),
+                    on_tool_call=lambda tool, args, tool_use_id, sn=step_number, sid=step["id"]: self._log_tool_call(sid, sn, tool, args, tool_use_id),
+                )
 
             # Mark comments as processed
             for comment in comments:
@@ -679,6 +1048,13 @@ class PipelineEngine:
                 "comments_addressed": len(comments),
             })
 
+            # Update session progress after successful review
+            if self._session:
+                await session_store.update_session_progress(
+                    self.pipeline_id,
+                    step_number,
+                )
+
         except Exception as e:
             await db.execute("""
                 UPDATE pipeline_steps SET status = 'failed', error_message = ? WHERE id = ?
@@ -693,6 +1069,12 @@ class PipelineEngine:
             await broadcast_message({
                 "type": "pipeline_failed",
                 "pipeline_id": self.pipeline_id,
-                "step": 8,
+                "step": step_number,
                 "error": str(e),
             })
+
+        finally:
+            # Clean up session after review step
+            if self._session:
+                await self._session.close()
+                self._session = None

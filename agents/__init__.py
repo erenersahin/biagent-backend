@@ -13,6 +13,13 @@ from .base import (
     CostTracker,
     CostTrackerConfig,
     DEFAULT_COST_CONFIG,
+    PIPELINE_SUBAGENTS,
+)
+from .pipeline_session import (
+    PipelineSession,
+    SessionState,
+    StepResult,
+    STEP_NAMES,
 )
 from .context_agent import ContextAgent
 from .risk_agent import RiskAgent
@@ -74,6 +81,12 @@ __all__ = [
     "CostTracker",
     "CostTrackerConfig",
     "DEFAULT_COST_CONFIG",
+    # Pipeline session (persistent ClaudeSDKClient)
+    "PipelineSession",
+    "SessionState",
+    "StepResult",
+    "STEP_NAMES",
+    "PIPELINE_SUBAGENTS",
     # Factory
     "create_agent",
     # Agent implementations

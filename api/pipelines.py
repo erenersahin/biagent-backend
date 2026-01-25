@@ -21,12 +21,14 @@ router = APIRouter()
 class PipelineCreate(BaseModel):
     """Request to create a new pipeline."""
     ticket_key: str
+    cycle_type: Optional[str] = "backend"  # Default to backend cycle
 
 
 class PipelineResponse(BaseModel):
     """Pipeline response model."""
     id: str
     ticket_key: str
+    cycle_type: Optional[str] = "backend"
     status: str
     current_step: int
     created_at: str
@@ -38,6 +40,47 @@ class PipelineResponse(BaseModel):
     # Worktree session data (included when status is needs_user_input)
     worktree_status: Optional[str] = None
     user_input_request: Optional[Dict] = None
+
+
+class PullRequestResponse(BaseModel):
+    """Pull request response model."""
+    id: str
+    pipeline_id: str
+    pr_number: int
+    pr_url: str
+    branch: str
+    status: str
+    approval_count: int
+    created_at: str
+    approved_at: Optional[str] = None
+    merged_at: Optional[str] = None
+
+
+class ReviewCommentResponse(BaseModel):
+    """Review comment response model."""
+    id: str
+    pr_id: str
+    github_comment_id: Optional[str] = None
+    comment_body: str
+    file_path: Optional[str] = None
+    line_number: Optional[int] = None
+    reviewer: Optional[str] = None
+    review_state: Optional[str] = None
+    processed: bool
+    agent_response: Optional[str] = None
+    created_at: str
+    processed_at: Optional[str] = None
+
+
+class ReviewIterationResponse(BaseModel):
+    """Review iteration response model."""
+    id: str
+    pr_id: str
+    iteration_number: int
+    comments_received: Optional[int] = None
+    comments_addressed: Optional[int] = None
+    commit_sha: Optional[str] = None
+    created_at: str
 
 
 class StepResponse(BaseModel):
@@ -74,6 +117,11 @@ class RestartRequest(BaseModel):
     guidance: Optional[str] = None
 
 
+class SkipStepRequest(BaseModel):
+    """Request to skip a step."""
+    reason: Optional[str] = None
+
+
 class ProvideInputRequest(BaseModel):
     """Request to provide user input for pipeline (e.g., setup commands)."""
     input_type: str  # "setup_commands"
@@ -92,14 +140,20 @@ async def create_pipeline(request: PipelineCreate):
     if not ticket:
         raise HTTPException(status_code=404, detail=f"Ticket {request.ticket_key} not found")
 
+    # Validate cycle_type if provided
+    cycle_type = request.cycle_type or "backend"
+    valid_cycle_types = ["backend", "frontend", "fullstack", "spike", "oncall_bug"]
+    if cycle_type not in valid_cycle_types:
+        raise HTTPException(status_code=400, detail=f"Invalid cycle_type. Must be one of: {valid_cycle_types}")
+
     # Create pipeline
     pipeline_id = generate_id()
     now = datetime.utcnow().isoformat()
 
     await db.execute("""
-        INSERT INTO pipelines (id, ticket_key, status, current_step, created_at)
-        VALUES (?, ?, 'pending', 1, ?)
-    """, (pipeline_id, request.ticket_key, now))
+        INSERT INTO pipelines (id, ticket_key, cycle_type, status, current_step, created_at)
+        VALUES (?, ?, ?, 'pending', 1, ?)
+    """, (pipeline_id, request.ticket_key, cycle_type, now))
 
     # Create steps up to max_steps (configurable, default 6 to skip PR/Review)
     max_steps = settings.max_steps
@@ -117,6 +171,7 @@ async def create_pipeline(request: PipelineCreate):
     return PipelineResponse(
         id=pipeline_id,
         ticket_key=request.ticket_key,
+        cycle_type=cycle_type,
         status="pending",
         current_step=1,
         created_at=now,
@@ -255,13 +310,13 @@ async def get_all_step_outputs(pipeline_id: str):
         tool_calls = []
         if not events:
             tc_rows = await db.fetchall("""
-                SELECT tool_name, arguments, created_at
+                SELECT tool_name, tool_use_id, arguments, created_at
                 FROM tool_calls
                 WHERE step_id = ?
                 ORDER BY created_at ASC
             """, (step_id,))
             tool_calls = [
-                {"tool": tc["tool_name"], "arguments": tc["arguments"], "timestamp": tc["created_at"]}
+                {"tool": tc["tool_name"], "tool_use_id": tc["tool_use_id"], "arguments": tc["arguments"], "timestamp": tc["created_at"]}
                 for tc in tc_rows
             ]
 
@@ -570,6 +625,123 @@ async def provide_step_feedback(
     }
 
 
+@router.post("/{pipeline_id}/steps/{step_number}/skip")
+async def skip_step(
+    pipeline_id: str,
+    step_number: int,
+    request: SkipStepRequest,
+    background_tasks: BackgroundTasks
+):
+    """Skip a step and move to the next one.
+
+    This allows users to bypass a failed or unnecessary step.
+    The step will be marked as 'skipped' with an optional reason.
+    """
+    db = await get_db()
+
+    pipeline = await db.fetchone(
+        "SELECT * FROM pipelines WHERE id = ?", (pipeline_id,)
+    )
+    if not pipeline:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+
+    step = await db.fetchone("""
+        SELECT * FROM pipeline_steps
+        WHERE pipeline_id = ? AND step_number = ?
+    """, (pipeline_id, step_number))
+
+    if not step:
+        raise HTTPException(status_code=404, detail="Step not found")
+
+    # Can only skip steps that are failed, paused, or pending
+    if step["status"] not in ("failed", "paused", "pending"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Step cannot be skipped from status: {step['status']}"
+        )
+
+    now = datetime.utcnow().isoformat()
+    max_steps = settings.max_steps
+
+    # Mark step as skipped
+    skip_reason = request.reason or "Skipped by user"
+    await db.execute("""
+        UPDATE pipeline_steps
+        SET status = 'skipped', completed_at = ?, error_message = ?
+        WHERE pipeline_id = ? AND step_number = ?
+    """, (now, f"[SKIPPED] {skip_reason}", pipeline_id, step_number))
+
+    # Determine next step
+    next_step = step_number + 1
+    is_last_step = next_step > max_steps
+
+    if is_last_step:
+        # This was the last step, mark pipeline as completed
+        await db.execute("""
+            UPDATE pipelines
+            SET status = 'completed', completed_at = ?, current_step = ?
+            WHERE id = ?
+        """, (now, step_number, pipeline_id))
+        await db.commit()
+
+        # Broadcast completion
+        from websocket.manager import broadcast_message
+        await broadcast_message({
+            "type": "pipeline_completed",
+            "pipeline_id": pipeline_id,
+            "total_tokens": pipeline["total_tokens"],
+            "total_cost": pipeline["total_cost"]
+        })
+
+        return {
+            "status": "step_skipped",
+            "pipeline_id": pipeline_id,
+            "step": step_number,
+            "reason": skip_reason,
+            "pipeline_status": "completed",
+            "next_step": None
+        }
+    else:
+        # Move to next step
+        await db.execute("""
+            UPDATE pipelines
+            SET status = 'running', current_step = ?, pause_requested = FALSE
+            WHERE id = ?
+        """, (next_step, pipeline_id))
+
+        # Set next step to running
+        await db.execute("""
+            UPDATE pipeline_steps
+            SET status = 'running', started_at = ?
+            WHERE pipeline_id = ? AND step_number = ?
+        """, (now, pipeline_id, next_step))
+
+        await db.commit()
+
+        # Broadcast the skip event
+        from websocket.manager import broadcast_message
+        await broadcast_message({
+            "type": "step_skipped",
+            "pipeline_id": pipeline_id,
+            "step": step_number,
+            "reason": skip_reason,
+            "next_step": next_step
+        })
+
+        # Start execution from next step
+        engine = PipelineEngine(pipeline_id)
+        background_tasks.add_task(engine.run)
+
+        return {
+            "status": "step_skipped",
+            "pipeline_id": pipeline_id,
+            "step": step_number,
+            "reason": skip_reason,
+            "pipeline_status": "running",
+            "next_step": next_step
+        }
+
+
 @router.get("/{pipeline_id}/steps/{step_number}/history")
 async def get_step_history(pipeline_id: str, step_number: int):
     """Get step revision history."""
@@ -692,3 +864,131 @@ async def provide_pipeline_input(
             status_code=400,
             detail=f"Unknown input type: {request.input_type}"
         )
+
+
+# ============================================================
+# CODE REVIEW ENDPOINTS
+# ============================================================
+
+@router.get("/{pipeline_id}/pr", response_model=PullRequestResponse)
+async def get_pipeline_pr(pipeline_id: str):
+    """Get the pull request associated with a pipeline."""
+    db = await get_db()
+
+    pipeline = await db.fetchone(
+        "SELECT id FROM pipelines WHERE id = ?", (pipeline_id,)
+    )
+    if not pipeline:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+
+    pr = await db.fetchone("""
+        SELECT * FROM pull_requests
+        WHERE pipeline_id = ?
+        ORDER BY created_at DESC
+        LIMIT 1
+    """, (pipeline_id,))
+
+    if not pr:
+        raise HTTPException(status_code=404, detail="No pull request found for this pipeline")
+
+    return PullRequestResponse(**pr)
+
+
+@router.get("/{pipeline_id}/reviews")
+async def get_pipeline_reviews(pipeline_id: str):
+    """Get all review comments and iterations for a pipeline's PR."""
+    db = await get_db()
+
+    pipeline = await db.fetchone(
+        "SELECT id FROM pipelines WHERE id = ?", (pipeline_id,)
+    )
+    if not pipeline:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+
+    # Get the PR for this pipeline
+    pr = await db.fetchone("""
+        SELECT id FROM pull_requests
+        WHERE pipeline_id = ?
+        ORDER BY created_at DESC
+        LIMIT 1
+    """, (pipeline_id,))
+
+    if not pr:
+        return {
+            "pr": None,
+            "comments": [],
+            "iterations": []
+        }
+
+    # Get all comments for this PR
+    comments = await db.fetchall("""
+        SELECT * FROM review_comments
+        WHERE pr_id = ?
+        ORDER BY created_at ASC
+    """, (pr["id"],))
+
+    # Get all iterations for this PR
+    iterations = await db.fetchall("""
+        SELECT * FROM review_iterations
+        WHERE pr_id = ?
+        ORDER BY iteration_number ASC
+    """, (pr["id"],))
+
+    return {
+        "pr": pr,
+        "comments": [ReviewCommentResponse(**c) for c in comments],
+        "iterations": [ReviewIterationResponse(**i) for i in iterations]
+    }
+
+
+@router.post("/{pipeline_id}/complete")
+async def mark_pipeline_complete(pipeline_id: str):
+    """Mark a pipeline as complete (manually complete after PR approval)."""
+    db = await get_db()
+
+    pipeline = await db.fetchone(
+        "SELECT * FROM pipelines WHERE id = ?", (pipeline_id,)
+    )
+    if not pipeline:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+
+    # Can complete from waiting_for_review or running status
+    if pipeline["status"] not in ("waiting_for_review", "running", "paused"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Pipeline cannot be completed from status: {pipeline['status']}"
+        )
+
+    now = datetime.utcnow().isoformat()
+
+    # Update pipeline status
+    await db.execute("""
+        UPDATE pipelines
+        SET status = 'completed', completed_at = ?
+        WHERE id = ?
+    """, (now, pipeline_id))
+
+    # Mark all remaining steps as completed
+    await db.execute("""
+        UPDATE pipeline_steps
+        SET status = 'completed', completed_at = ?
+        WHERE pipeline_id = ? AND status NOT IN ('completed', 'skipped', 'failed')
+    """, (now, pipeline_id))
+
+    await db.commit()
+
+    # Broadcast completion
+    from websocket.manager import broadcast_message
+    await broadcast_message({
+        "type": "pipeline_completed",
+        "pipeline_id": pipeline_id,
+        "total_tokens": pipeline["total_tokens"],
+        "total_cost": pipeline["total_cost"],
+        "manual_completion": True
+    })
+
+    return {
+        "status": "completed",
+        "pipeline_id": pipeline_id,
+        "completed_at": now
+    }

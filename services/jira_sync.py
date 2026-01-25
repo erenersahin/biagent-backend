@@ -82,7 +82,7 @@ async def fetch_jira_tickets(jql: Optional[str] = None) -> list[dict]:
             json={
                 "jql": jql,
                 "maxResults": 100,
-                "fields": ["summary", "description", "status", "priority", "assignee", "project", "issuetype", "created", "updated", "parent"],
+                "fields": ["summary", "description", "status", "priority", "assignee", "project", "issuetype", "created", "updated", "parent", "attachment"],
             },
             auth=(settings.jira_email, settings.jira_api_token),
             headers={"Content-Type": "application/json"},
@@ -91,6 +91,29 @@ async def fetch_jira_tickets(jql: Optional[str] = None) -> list[dict]:
         data = response.json()
 
     return data.get("issues", [])
+
+
+def parse_jira_attachments(issue: dict) -> list[dict]:
+    """Parse attachments from JIRA API response."""
+    fields = issue.get("fields", {})
+    attachments_raw = fields.get("attachment", [])
+    ticket_key = issue.get("key", "")
+
+    attachments = []
+    for att in attachments_raw:
+        attachments.append({
+            "id": att.get("id", ""),
+            "ticket_key": ticket_key,
+            "filename": att.get("filename", ""),
+            "mime_type": att.get("mimeType", ""),
+            "size": att.get("size", 0),
+            "content_url": att.get("content", ""),
+            "thumbnail_url": att.get("thumbnail", ""),
+            "author": att.get("author", {}).get("displayName", "") if att.get("author") else "",
+            "created_at": att.get("created", ""),
+        })
+
+    return attachments
 
 
 def parse_jira_ticket(issue: dict) -> dict:
@@ -142,6 +165,7 @@ async def sync_tickets(sync_type: str = "auto") -> int:
         count = 0
         for issue in issues:
             ticket = parse_jira_ticket(issue)
+            attachments = parse_jira_attachments(issue)
             now = datetime.utcnow().isoformat()
 
             # Upsert ticket
@@ -170,6 +194,20 @@ async def sync_tickets(sync_type: str = "auto") -> int:
                 ticket["epic_name"], ticket["created_at"], ticket["updated_at"],
                 ticket["jira_updated_at"], now, ticket["raw_json"], now
             ))
+
+            # Sync attachments - delete old ones and insert new
+            await db.execute("DELETE FROM ticket_attachments WHERE ticket_key = ?", (ticket["key"],))
+            for att in attachments:
+                await db.execute("""
+                    INSERT INTO ticket_attachments
+                    (id, ticket_key, filename, mime_type, size, content_url, thumbnail_url, author, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    att["id"], att["ticket_key"], att["filename"], att["mime_type"],
+                    att["size"], att["content_url"], att["thumbnail_url"],
+                    att["author"], att["created_at"]
+                ))
+
             count += 1
 
         # Record sync
