@@ -69,6 +69,18 @@ STEP_NAMES = {
     8: "Code Review Response",
 }
 
+# Map step numbers to subagent names in PIPELINE_SUBAGENTS
+STEP_TO_SUBAGENT = {
+    1: "context_agent",
+    2: "risk_agent",
+    3: "planning_agent",
+    4: "coding_agent",
+    5: "testing_agent",
+    6: "docs_agent",
+    7: "pr_agent",
+    8: "review_agent",
+}
+
 
 class PipelineSession:
     """Manages a persistent ClaudeSDKClient session across pipeline steps.
@@ -161,28 +173,39 @@ class PipelineSession:
         summary = self.ticket_context.get('summary', 'No summary')
         description = self.ticket_context.get('description', 'No description')
 
-        return f"""You are starting a software development pipeline for ticket {ticket_key}.
+        return f"""You are the Pipeline Orchestrator for BiAgent, managing a software development pipeline for ticket {ticket_key}.
+
+## Your Role
+You coordinate the pipeline by spawning specialized subagents for each step using the Task tool.
+You maintain context across all steps and ensure information flows between subagents.
 
 ## Ticket Information
 - **Key**: {ticket_key}
 - **Summary**: {summary}
 - **Description**: {description}
 
-## Pipeline Overview
-You will execute up to 8 steps in sequence:
-1. Context & Requirements - Gather and analyze ticket context
-2. Risk & Blocker Analysis - Identify risks and blockers
-3. Implementation Planning - Plan the implementation
-4. Code Implementation - Write the code
-5. Test Writing & Execution - Write and run tests
-6. Documentation Updates - Update documentation
-7. PR Creation - Create pull request
-8. Code Review Response - Address review comments
+## Pipeline Steps & Subagents
+You will orchestrate 8 steps, each handled by a specialized subagent:
 
-I will guide you through each step. Remember everything from previous steps
-and reference your earlier analysis and decisions where relevant.
+| Step | Name | Subagent |
+|------|------|----------|
+| 1 | Context & Requirements | context_agent |
+| 2 | Risk & Blocker Analysis | risk_agent |
+| 3 | Implementation Planning | planning_agent |
+| 4 | Code Implementation | coding_agent |
+| 5 | Test Writing & Execution | testing_agent |
+| 6 | Documentation Updates | docs_agent |
+| 7 | PR Creation | pr_agent |
+| 8 | Code Review Response | review_agent |
 
-Acknowledge that you understand and are ready to begin with a brief confirmation.
+## How to Use Subagents
+For each step, you will receive instructions to spawn a subagent using the Task tool.
+Pass the task context to the subagent and summarize its output when it completes.
+
+IMPORTANT: Subagents cannot see your conversation history. You must include all
+relevant context from previous steps in your prompt to each subagent.
+
+Acknowledge that you understand your role as orchestrator and are ready to begin.
 """
 
     async def execute_step(
@@ -193,6 +216,7 @@ Acknowledge that you understand and are ready to begin with a brief confirmation
         on_token: Optional[Callable[[str], Any]] = None,
         on_tool_call: Optional[Callable[[str, dict, str], Any]] = None,
         on_subagent_tool_call: Optional[Callable[[str, str, str, dict], Any]] = None,
+        on_subagent_text: Optional[Callable[[str, str], Any]] = None,
     ) -> StepResult:
         """Execute a pipeline step within the persistent session.
 
@@ -208,6 +232,8 @@ Acknowledge that you understand and are ready to begin with a brief confirmation
             on_tool_call: Callback for tool invocations (tool_name, args, tool_use_id)
             on_subagent_tool_call: Callback for subagent tool invocations
                                    (parent_tool_use_id, tool_name, tool_use_id, args)
+            on_subagent_text: Callback for subagent text content
+                              (parent_tool_use_id, text)
 
         Returns:
             StepResult with content, structured_output, and cost info
@@ -243,8 +269,17 @@ Acknowledge that you understand and are ready to begin with a brief confirmation
 
                     for block in message.content:
                         if isinstance(block, TextBlock):
-                            # Only accumulate text from main agent, not subagents
-                            if not parent_tool_use_id:
+                            if parent_tool_use_id:
+                                # This is SUBAGENT text - route to subagent text handler
+                                if on_subagent_text:
+                                    result = on_subagent_text(
+                                        parent_tool_use_id,
+                                        block.text,
+                                    )
+                                    if asyncio.iscoroutine(result):
+                                        await result
+                            else:
+                                # Main agent text - accumulate and stream
                                 text = block.text
                                 full_response += text
                                 if on_token:
@@ -316,30 +351,45 @@ Acknowledge that you understand and are ready to begin with a brief confirmation
     ) -> str:
         """Build the prompt for a specific step.
 
-        Since we're in a persistent session, we can reference previous work
-        and Claude will remember it without needing to pass full context.
+        Instructs the main orchestrator to spawn the appropriate subagent
+        via the Task tool for specialized handling of each step.
         """
         step_name = STEP_NAMES.get(step_number, f"Step {step_number}")
+        subagent_name = STEP_TO_SUBAGENT.get(step_number)
 
-        # Get the agent's system prompt and user prompt
-        system_prompt = agent.system_prompt
+        # Get the user prompt with task-specific context
         user_prompt = agent.build_user_prompt(context)
 
+        # Build orchestrator instruction to spawn subagent
         return f"""
-## Starting Pipeline Step {step_number}: {step_name}
+## Pipeline Step {step_number}: {step_name}
 
-### Role and Guidelines
-{system_prompt}
+You MUST use the Task tool to spawn the "{subagent_name}" subagent to handle this step.
+
+### Instructions for the Subagent
+
+Pass the following task context to the subagent:
 
 ---
-
-### Task Instructions
 {user_prompt}
-
 ---
 
-Remember: You have full context from all previous steps in this session.
-Reference your earlier analysis, decisions, and any code you've written where relevant.
+### How to Proceed
+
+1. Use the Task tool with:
+   - subagent_type: "{subagent_name}"
+   - description: "Execute {step_name}"
+   - prompt: Include ALL the task instructions above
+
+2. The subagent will execute the step and return its output.
+
+3. After the subagent completes, summarize its key findings/outputs.
+
+IMPORTANT:
+- You have full context from all previous steps in this session.
+- The subagent can access files and tools but NOT your conversation history.
+- Include any relevant context from previous steps in your prompt to the subagent.
+- After receiving the subagent's response, provide a brief summary for the next step.
 """
 
     async def inject_clarification(self, response: str) -> StepResult:

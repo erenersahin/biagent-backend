@@ -20,6 +20,7 @@ from .pipeline_session import (
     SessionState,
     StepResult,
     STEP_NAMES,
+    STEP_TO_SUBAGENT,
 )
 from .context_agent import ContextAgent
 from .risk_agent import RiskAgent
@@ -86,6 +87,7 @@ __all__ = [
     "SessionState",
     "StepResult",
     "STEP_NAMES",
+    "STEP_TO_SUBAGENT",
     "PIPELINE_SUBAGENTS",
     # Factory
     "create_agent",

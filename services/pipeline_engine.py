@@ -198,6 +198,7 @@ class PipelineEngine:
                     on_token=lambda token: self._stream_token(step_number, token),
                     on_tool_call=lambda tool, args, tool_use_id, sn=step_number, sid=step["id"]: self._log_tool_call(sid, sn, tool, args, tool_use_id),
                     on_subagent_tool_call=lambda parent_id, tool, tool_id, args, sn=step_number, sid=step["id"]: self._log_subagent_tool_call(sid, sn, parent_id, tool, tool_id, args),
+                    on_subagent_text=lambda parent_id, text, sn=step_number: self._stream_subagent_text(sn, parent_id, text),
                 )
                 result = {
                     "content": step_result.content,
@@ -601,6 +602,25 @@ class PipelineEngine:
             "tool_use_id": tool_use_id,
             "tool_name": tool_name,
             "arguments": arguments,
+            "timestamp": now,
+        })
+
+    async def _stream_subagent_text(
+        self,
+        step_number: int,
+        parent_tool_use_id: str,
+        text: str,
+    ):
+        """Stream subagent text content in real-time."""
+        now = datetime.utcnow().isoformat()
+
+        # Broadcast REAL-TIME to frontend
+        await broadcast_message({
+            "type": "subagent_text",
+            "pipeline_id": self.pipeline_id,
+            "step": step_number,
+            "parent_tool_use_id": parent_tool_use_id,
+            "text": text,
             "timestamp": now,
         })
 
