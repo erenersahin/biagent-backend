@@ -2,11 +2,12 @@
 BiAgent Configuration
 
 Environment-based configuration with Pydantic settings.
+Supports both consumer (local) and organization (multi-tenant) tiers.
 """
 
 from pydantic_settings import BaseSettings
 from pydantic import Field
-from typing import Optional
+from typing import Optional, Literal
 from pathlib import Path
 
 
@@ -19,8 +20,43 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
 
-    # Database
+    # Deployment Tier
+    tier: Literal["consumer", "organization"] = Field(
+        default="consumer",
+        description="Deployment tier: 'consumer' for local, 'organization' for multi-tenant SaaS"
+    )
+
+    # Database - SQLite (consumer) or PostgreSQL (organization)
     db_path: str = str(Path(__file__).parent.parent / "data" / "biagent.db")
+    database_url: Optional[str] = Field(
+        default=None,
+        description="SQLAlchemy database URL. If not set, uses SQLite at db_path"
+    )
+
+    @property
+    def effective_database_url(self) -> str:
+        """Get the effective database URL for SQLAlchemy."""
+        if self.database_url:
+            return self.database_url
+        return f"sqlite+aiosqlite:///{self.db_path}"
+
+    # Authentication - Clerk
+    auth_enabled: bool = Field(
+        default=False,
+        description="Enable Clerk authentication. Set to true for organization tier."
+    )
+    clerk_secret_key: Optional[str] = Field(
+        default=None,
+        description="Clerk secret key for backend API"
+    )
+    clerk_publishable_key: Optional[str] = Field(
+        default=None,
+        description="Clerk publishable key for frontend"
+    )
+    clerk_authorized_parties: Optional[str] = Field(
+        default=None,
+        description="Comma-separated list of authorized frontend origins"
+    )
 
     # JIRA Configuration
     jira_base_url: Optional[str] = None

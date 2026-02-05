@@ -6,6 +6,9 @@ python-multipart>=0.0.6
 
 # Database
 aiosqlite>=0.19.0
+sqlalchemy[asyncio]>=2.0.25
+alembic>=1.13.0
+asyncpg>=0.29.0  # PostgreSQL async driver for production
 
 # Claude Agent SDK (uses Claude Code credentials automatically)
 claude-agent-sdk>=0.1.0
@@ -27,3 +30,9 @@ pydantic-settings>=2.1.0
 
 # Utilities
 uuid6>=2024.1.12
+
+# Authentication
+clerk-backend-api>=1.0.0
+
+# Encryption (for organization tier credential storage)
+cryptography>=42.0.0

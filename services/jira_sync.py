@@ -283,13 +283,7 @@ async def start_sync_scheduler():
     """Start the background sync scheduler."""
     global _sync_task
 
-    # Run initial sync
-    try:
-        await sync_tickets(sync_type="initial")
-    except Exception as e:
-        print(f"Initial sync error: {e}")
-
-    # Start scheduler
+    # Start scheduler (initial sync will happen on first iteration)
     _sync_task = asyncio.create_task(sync_scheduler())
 
 
