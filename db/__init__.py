@@ -13,7 +13,7 @@ import json
 from datetime import datetime
 import uuid6
 
-from .schema import SCHEMA_SQL
+from .schema import SCHEMA_SQL, get_migration_sql
 
 # Database file path
 DB_PATH = os.environ.get("BIAGENT_DB_PATH", str(Path(__file__).parent.parent.parent / "data" / "biagent.db"))
@@ -52,7 +52,25 @@ class Database:
         # Enable foreign keys
         await self._connection.execute("PRAGMA foreign_keys = ON")
 
-        # Initialize schema
+        # Check existing schema before running CREATE statements
+        # This allows us to run migrations for existing databases
+        existing_tool_calls_cols = []
+        try:
+            cursor = await self._connection.execute("PRAGMA table_info(tool_calls)")
+            rows = await cursor.fetchall()
+            existing_tool_calls_cols = [row[1] for row in rows]  # Column name is at index 1
+        except Exception:
+            pass  # Table doesn't exist yet, that's fine
+
+        # Run migrations BEFORE schema (so indexes on new columns work)
+        # This adds columns to existing tables before CREATE IF NOT EXISTS runs
+        if existing_tool_calls_cols:
+            migration_sql = get_migration_sql(existing_tool_calls_cols)
+            if migration_sql:
+                await self._connection.executescript(migration_sql)
+                await self._connection.commit()
+
+        # Initialize schema (CREATE IF NOT EXISTS handles existing tables)
         await self._connection.executescript(SCHEMA_SQL)
         await self._connection.commit()
 

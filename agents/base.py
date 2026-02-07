@@ -6,6 +6,8 @@ Supports subagents, sessions, custom tools, and comprehensive error handling.
 """
 
 import asyncio
+import json
+import re
 from typing import Optional, Callable, Any
 from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
@@ -145,6 +147,7 @@ class AgentContext:
     ticket: dict
     codebase_path: str
     sandbox_branch: str
+    step_id: Optional[str] = None  # Current step ID for clarification requests
     step_1_output: Optional[dict] = None
     step_2_output: Optional[dict] = None
     step_3_output: Optional[dict] = None
@@ -154,11 +157,20 @@ class AgentContext:
     step_7_output: Optional[dict] = None
     user_feedback: Optional[str] = None
     user_guidance: Optional[str] = None
+    clarification_answer: Optional[str] = None  # Answer to a previous clarification
     review_comments: Optional[list] = None
     pr: Optional[dict] = None
     # Worktree isolation fields
     is_worktree: bool = False  # Whether running in an isolated worktree
     worktree_paths: Optional[dict] = None  # Map of repo_name -> worktree_path
+
+
+@dataclass
+class ClarificationRequest:
+    """A request for user clarification from an agent."""
+    question: str
+    options: list[str]
+    context: str = ""
 
 
 @dataclass
@@ -171,6 +183,65 @@ class AgentResult:
     files_created: list = field(default_factory=list)
     files_modified: list = field(default_factory=list)
     commit_sha: Optional[str] = None
+    clarification_request: Optional[ClarificationRequest] = None  # If agent needs user input
+
+
+# Clarification instruction to append to agent prompts
+CLARIFICATION_INSTRUCTION = """
+## REQUESTING CLARIFICATION
+
+If you encounter any of these situations, you MUST request clarification before proceeding:
+- Ambiguous requirements that could be interpreted multiple ways
+- Missing critical information needed to proceed
+- Multiple valid implementation approaches where user preference matters
+- Potential breaking changes that need explicit approval
+- Security or data handling decisions that require user input
+
+To request clarification, output a JSON block with this EXACT format:
+
+```clarification
+{
+  "question": "Your clear, specific question",
+  "options": ["Option 1", "Option 2", "Option 3"],
+  "context": "Why you're asking and what impact each option has"
+}
+```
+
+IMPORTANT:
+- Use 2-4 options that cover the reasonable choices
+- The question must be specific and actionable
+- After outputting the clarification request, STOP and wait - do not continue with implementation
+"""
+
+
+def parse_clarification_request(content: str) -> Optional[ClarificationRequest]:
+    """Parse a clarification request from agent output.
+
+    Looks for a ```clarification code block with JSON content.
+    """
+    # Look for clarification code block
+    pattern = r'```clarification\s*([\s\S]*?)\s*```'
+    match = re.search(pattern, content)
+
+    if not match:
+        return None
+
+    try:
+        data = json.loads(match.group(1))
+        question = data.get("question", "")
+        options = data.get("options", [])
+        context = data.get("context", "")
+
+        if question and options and len(options) >= 2:
+            return ClarificationRequest(
+                question=question,
+                options=options[:4],  # Max 4 options
+                context=context
+            )
+    except (json.JSONDecodeError, KeyError, TypeError):
+        pass
+
+    return None
 
 
 class BaseAgent(ABC):
@@ -182,6 +253,7 @@ class BaseAgent(ABC):
     - Custom tools via MCP servers
     - Comprehensive error handling
     - Configurable cost tracking
+    - Clarification requests for ambiguous situations
     """
 
     # Map of tool names to SDK tool names
@@ -194,6 +266,9 @@ class BaseAgent(ABC):
         "jira_cli": "Bash",
         "github_cli": "Bash",
     }
+
+    # Whether this agent type can request clarifications
+    CAN_REQUEST_CLARIFICATION = True
 
     def __init__(
         self,
@@ -219,12 +294,17 @@ class BaseAgent(ABC):
 
     def get_agent_options(self, context: AgentContext) -> ClaudeAgentOptions:
         """Build ClaudeAgentOptions for this agent."""
+        # Build system prompt with clarification instruction if enabled
+        system_prompt = self.system_prompt
+        if self.CAN_REQUEST_CLARIFICATION:
+            system_prompt += "\n\n" + CLARIFICATION_INSTRUCTION
+
         return ClaudeAgentOptions(
             cwd=context.codebase_path,
             allowed_tools=self.get_allowed_tools(),
             permission_mode="acceptEdits",
             max_turns=50,
-            system_prompt=self.system_prompt,
+            system_prompt=system_prompt,
         )
 
     @property
@@ -242,19 +322,30 @@ class BaseAgent(ABC):
         self,
         context: AgentContext,
         on_token: Optional[Callable[[str], Any]] = None,
-        on_tool_call: Optional[Callable[[str, dict], Any]] = None,
+        on_tool_call: Optional[Callable[[str, dict, str], Any]] = None,
     ) -> dict:
         """Execute the agent with streaming using Claude Agent SDK.
 
         Args:
             context: The agent context with ticket and pipeline info
             on_token: Callback for streaming text tokens
-            on_tool_call: Callback for tool invocations
+            on_tool_call: Callback for tool invocations (tool_name, args, tool_use_id)
 
         Returns:
             dict with content, structured_output, tokens_used, and cost
         """
         user_prompt = self.build_user_prompt(context)
+
+        # Prepend clarification answer if resuming from a clarification
+        if context.clarification_answer:
+            user_prompt = (
+                f"## CLARIFICATION RESPONSE\n\n"
+                f"You previously asked for clarification. The user's answer is:\n"
+                f"**{context.clarification_answer}**\n\n"
+                f"Please continue with your task using this information.\n\n"
+                f"---\n\n{user_prompt}"
+            )
+
         options = self.get_agent_options(context)
 
         tracker = CostTracker(self.cost_config)
@@ -274,7 +365,7 @@ class BaseAgent(ABC):
 
                         elif isinstance(block, ToolUseBlock):
                             if on_tool_call:
-                                result = on_tool_call(block.name, block.input or {})
+                                result = on_tool_call(block.name, block.input or {}, block.id)
                                 if asyncio.iscoroutine(result):
                                     await result
 
@@ -309,11 +400,25 @@ class BaseAgent(ABC):
         # Calculate cost if not provided
         tracker.calculate_cost()
 
-        return {
+        # Check for clarification request in response
+        clarification = None
+        if self.CAN_REQUEST_CLARIFICATION:
+            clarification = parse_clarification_request(full_response)
+
+        result = {
             "content": full_response,
             "structured_output": self.parse_output(full_response),
             **tracker.get_result(),
         }
+
+        if clarification:
+            result["clarification_request"] = {
+                "question": clarification.question,
+                "options": clarification.options,
+                "context": clarification.context,
+            }
+
+        return result
 
     def parse_output(self, content: str) -> Optional[dict]:
         """Parse structured output from response. Override in subclasses."""
@@ -425,54 +530,232 @@ class SessionAgent(BaseAgent):
             await self.disconnect()
 
 
-# Subagent definitions for pipeline steps
+# =============================================================================
+# Pipeline Step Subagent Definitions
+# =============================================================================
+# These subagents are spawned via the Task tool by the main pipeline orchestrator.
+# Each maps to a pipeline step and contains the specialized prompt for that step.
+
 PIPELINE_SUBAGENTS = {
-    "context_analyzer": AgentDefinition(
-        description="Analyzes ticket context, requirements, and codebase structure",
-        prompt="You are an expert at understanding software requirements and analyzing codebases.",
+    # Step 1: Context & Requirements
+    "context_agent": AgentDefinition(
+        description="Gathers context and requirements for JIRA tickets by analyzing the ticket, searching the codebase, and identifying relevant files and patterns",
+        prompt="""You are the Context & Requirements Agent for BiAgent, an AI-powered development system.
+
+Your role is to gather all necessary context for implementing a JIRA ticket. You will:
+
+1. Analyze the ticket details (summary, description, acceptance criteria)
+2. Find related tickets and dependencies
+3. Search the codebase for relevant files and patterns
+4. Identify key requirements and constraints
+
+OUTPUT FORMAT:
+Your output should be a comprehensive context summary that includes:
+- Ticket summary and key requirements
+- Related tickets and their status
+- Relevant codebase files identified
+- Technical constraints discovered
+- Any questions or ambiguities found
+
+Be thorough but concise. Focus on information that will help the subsequent agents.""",
+        tools=["Read", "Grep", "Glob", "Bash"],
+        model="sonnet"
+    ),
+
+    # Step 2: Risk & Blocker Analysis
+    "risk_agent": AgentDefinition(
+        description="Identifies technical risks, blockers, and potential issues that could impact implementation",
+        prompt="""You are the Risk & Blocker Analysis Agent for BiAgent.
+
+Your role is to identify potential risks and blockers BEFORE implementation begins. You will:
+
+1. Analyze the context gathered in Step 1
+2. Identify technical risks (complexity, dependencies, breaking changes)
+3. Find potential blockers (missing info, external dependencies, permissions)
+4. Assess security implications
+5. Estimate effort and flag time-sensitive concerns
+
+OUTPUT FORMAT - Return a JSON block with risk cards:
+```json
+{
+  "risk_cards": [
+    {
+      "severity": "high|medium|low",
+      "category": "technical|dependency|security|scope|timeline",
+      "title": "Brief risk title",
+      "description": "Detailed description of the risk",
+      "mitigation": "Suggested mitigation strategy",
+      "is_blocker": true|false
+    }
+  ],
+  "overall_risk_level": "high|medium|low",
+  "recommendation": "proceed|pause|clarify"
+}
+```
+
+Be thorough in identifying risks. It's better to flag a potential issue early than discover it during implementation.""",
         tools=["Read", "Grep", "Glob"],
         model="sonnet"
     ),
-    "risk_assessor": AgentDefinition(
-        description="Identifies risks, blockers, and potential issues",
-        prompt="You are a risk analyst specializing in software development risks.",
-        tools=["Read", "Grep"],
-        model="sonnet"
-    ),
-    "implementation_planner": AgentDefinition(
-        description="Creates detailed implementation plans and task breakdowns",
-        prompt="You are a software architect planning implementation strategies.",
+
+    # Step 3: Implementation Planning
+    "planning_agent": AgentDefinition(
+        description="Creates detailed implementation plans with task breakdowns and file change specifications",
+        prompt="""You are the Implementation Planning Agent for BiAgent.
+
+Your role is to create a detailed, actionable implementation plan based on the context and risk analysis. You will:
+
+1. Break down the implementation into discrete tasks
+2. Identify files that need to be created, modified, or deleted
+3. Define the order of operations
+4. Specify test requirements
+5. Account for identified risks in the plan
+
+OUTPUT FORMAT:
+Provide a structured plan including:
+- High-level approach summary
+- Task list with clear acceptance criteria for each
+- File changes matrix (which files to touch)
+- Test plan overview
+- Rollback considerations
+
+Make the plan specific enough that another agent can execute it without ambiguity.""",
         tools=["Read", "Grep", "Glob"],
         model="sonnet"
     ),
-    "code_implementer": AgentDefinition(
-        description="Writes and modifies code following best practices",
-        prompt="You are an expert developer implementing features.",
+
+    # Step 4: Code Implementation
+    "coding_agent": AgentDefinition(
+        description="Implements code changes following the plan, maintaining code quality and consistency with existing patterns",
+        prompt="""You are the Code Implementation Agent for BiAgent.
+
+Your role is to implement the planned changes. You will:
+
+1. Follow the implementation plan from Step 3
+2. Write clean, maintainable code
+3. Follow existing code patterns and conventions
+4. Handle edge cases appropriately
+5. Add appropriate comments where needed
+
+GUIDELINES:
+- Match the existing code style exactly
+- Don't over-engineer - implement exactly what's needed
+- Create appropriate error handling
+- Avoid breaking existing functionality
+- Keep commits atomic and well-described
+
+After implementation, provide a summary of:
+- Files created/modified
+- Key implementation decisions
+- Any deviations from the plan and why""",
         tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
-        model="opus"
+        model="sonnet"
     ),
-    "test_writer": AgentDefinition(
-        description="Creates comprehensive tests for code changes",
-        prompt="You are a QA engineer writing thorough tests.",
+
+    # Step 5: Test Writing & Execution
+    "testing_agent": AgentDefinition(
+        description="Creates comprehensive tests for code changes and runs existing test suites",
+        prompt="""You are the Testing Agent for BiAgent.
+
+Your role is to ensure code quality through comprehensive testing. You will:
+
+1. Write unit tests for new/modified functions
+2. Write integration tests where appropriate
+3. Run the existing test suite
+4. Verify the implementation meets requirements
+5. Check for edge cases and error conditions
+
+OUTPUT FORMAT:
+- List of tests created
+- Test coverage summary
+- Test execution results
+- Any failing tests and their causes
+- Recommendations for additional testing
+
+Ensure tests are maintainable and follow the project's testing patterns.""",
         tools=["Read", "Write", "Edit", "Bash", "Grep"],
         model="sonnet"
     ),
-    "documentation_writer": AgentDefinition(
-        description="Generates clear documentation and comments",
-        prompt="You are a technical writer creating documentation.",
+
+    # Step 6: Documentation Updates
+    "docs_agent": AgentDefinition(
+        description="Updates documentation including READMEs, API docs, and inline comments",
+        prompt="""You are the Documentation Agent for BiAgent.
+
+Your role is to ensure all changes are properly documented. You will:
+
+1. Update README files if needed
+2. Add/update API documentation
+3. Update changelog entries
+4. Ensure code comments are clear and helpful
+5. Update any related documentation
+
+GUIDELINES:
+- Keep documentation concise and actionable
+- Use clear examples where helpful
+- Follow existing documentation style
+- Don't document the obvious
+
+Output a summary of documentation updates made.""",
         tools=["Read", "Write", "Edit"],
-        model="sonnet"
+        model="haiku"
     ),
-    "pr_creator": AgentDefinition(
-        description="Creates pull requests with proper descriptions",
-        prompt="You are creating well-documented pull requests.",
+
+    # Step 7: PR Creation
+    "pr_agent": AgentDefinition(
+        description="Creates pull requests with comprehensive descriptions, test instructions, and proper labels",
+        prompt="""You are the PR Creation Agent for BiAgent.
+
+Your role is to create a well-documented pull request. You will:
+
+1. Stage and commit all changes with clear commit messages
+2. Push to the appropriate branch
+3. Create a PR with comprehensive description
+4. Add appropriate labels and reviewers
+5. Link to the original ticket
+
+PR DESCRIPTION FORMAT:
+## Summary
+[What this PR does in 1-2 sentences]
+
+## Changes
+- [List of key changes]
+
+## Testing
+- [How to test these changes]
+
+## Related
+- Ticket: [TICKET-KEY]
+
+Ensure the PR is ready for review.""",
         tools=["Read", "Bash", "Grep"],
         model="sonnet"
     ),
-    "code_reviewer": AgentDefinition(
-        description="Reviews code for quality, security, and best practices",
-        prompt="You are an expert code reviewer.",
-        tools=["Read", "Grep", "Edit", "Bash"],
+
+    # Step 8: Code Review Response
+    "review_agent": AgentDefinition(
+        description="Addresses PR review comments by making requested changes and responding to feedback",
+        prompt="""You are the Code Review Response Agent for BiAgent.
+
+Your role is to address PR review feedback. You will:
+
+1. Read and understand each review comment
+2. Make requested changes where appropriate
+3. Respond to questions and concerns
+4. Push updated commits
+5. Mark conversations as resolved where appropriate
+
+GUIDELINES:
+- Address each comment thoughtfully
+- If you disagree with feedback, explain your reasoning
+- Keep commits focused on specific feedback items
+- Update tests if code changes affect them
+
+Provide a summary of:
+- Comments addressed
+- Changes made
+- Any unresolved discussions""",
+        tools=["Read", "Write", "Edit", "Bash", "Grep"],
         model="sonnet"
     ),
 }

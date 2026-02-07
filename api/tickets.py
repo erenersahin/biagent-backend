@@ -5,15 +5,29 @@ Endpoints for managing JIRA ticket cache.
 """
 
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from typing import Optional
 from pydantic import BaseModel
 from datetime import datetime
+import httpx
 
 from db import get_db, generate_id, json_dumps, json_loads
 from config import settings
 
 
 router = APIRouter()
+
+
+class AttachmentResponse(BaseModel):
+    """Attachment response model."""
+    id: str
+    filename: str
+    mime_type: Optional[str] = None
+    size: Optional[int] = None
+    content_url: str
+    thumbnail_url: Optional[str] = None
+    author: Optional[str] = None
+    created_at: Optional[str] = None
 
 
 class TicketResponse(BaseModel):
@@ -32,6 +46,7 @@ class TicketResponse(BaseModel):
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
     pipeline_status: Optional[str] = None
+    attachments: list[AttachmentResponse] = []
 
 
 class TicketListResponse(BaseModel):
@@ -201,7 +216,18 @@ async def get_ticket(ticket_key: str):
     if not ticket:
         raise HTTPException(status_code=404, detail=f"Ticket {ticket_key} not found")
 
-    return TicketResponse(**ticket)
+    # Fetch attachments for this ticket
+    attachments = await db.fetchall("""
+        SELECT id, filename, mime_type, size, content_url, thumbnail_url, author, created_at
+        FROM ticket_attachments
+        WHERE ticket_key = ?
+        ORDER BY created_at DESC
+    """, (ticket_key,))
+
+    return TicketResponse(
+        **ticket,
+        attachments=[AttachmentResponse(**att) for att in attachments]
+    )
 
 
 @router.get("/{ticket_key}/related")
@@ -231,3 +257,110 @@ async def trigger_sync():
         return {"status": "success", "tickets_updated": count}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/attachments/{attachment_id}/content")
+async def get_attachment_content(attachment_id: str):
+    """Proxy endpoint to fetch attachment content from JIRA with authentication."""
+    db = await get_db()
+
+    # Get attachment from database
+    attachment = await db.fetchone("""
+        SELECT content_url, mime_type, filename
+        FROM ticket_attachments
+        WHERE id = ?
+    """, (attachment_id,))
+
+    if not attachment:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+
+    content_url = attachment["content_url"]
+    mime_type = attachment["mime_type"] or "application/octet-stream"
+    filename = attachment["filename"]
+
+    # Check if JIRA credentials are configured
+    if not all([settings.jira_base_url, settings.jira_email, settings.jira_api_token]):
+        raise HTTPException(status_code=500, detail="JIRA credentials not configured")
+
+    try:
+        # Fetch content from JIRA with authentication
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                content_url,
+                auth=(settings.jira_email, settings.jira_api_token),
+                follow_redirects=True,
+                timeout=30.0,
+            )
+            response.raise_for_status()
+
+            # Stream the response content
+            async def generate():
+                yield response.content
+
+            return StreamingResponse(
+                generate(),
+                media_type=mime_type,
+                headers={
+                    "Content-Disposition": f'inline; filename="{filename}"',
+                    "Cache-Control": "public, max-age=86400",  # Cache for 24 hours
+                }
+            )
+
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=e.response.status_code, detail="Failed to fetch attachment from JIRA")
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to connect to JIRA: {str(e)}")
+
+
+@router.get("/attachments/{attachment_id}/thumbnail")
+async def get_attachment_thumbnail(attachment_id: str):
+    """Proxy endpoint to fetch attachment thumbnail from JIRA with authentication."""
+    db = await get_db()
+
+    # Get attachment from database
+    attachment = await db.fetchone("""
+        SELECT thumbnail_url, content_url, mime_type, filename
+        FROM ticket_attachments
+        WHERE id = ?
+    """, (attachment_id,))
+
+    if not attachment:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+
+    # Use thumbnail URL if available, otherwise fall back to content URL
+    url = attachment["thumbnail_url"] or attachment["content_url"]
+    mime_type = attachment["mime_type"] or "image/png"
+    filename = attachment["filename"]
+
+    # Check if JIRA credentials are configured
+    if not all([settings.jira_base_url, settings.jira_email, settings.jira_api_token]):
+        raise HTTPException(status_code=500, detail="JIRA credentials not configured")
+
+    try:
+        # Fetch content from JIRA with authentication
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                url,
+                auth=(settings.jira_email, settings.jira_api_token),
+                follow_redirects=True,
+                timeout=30.0,
+            )
+            response.raise_for_status()
+
+            # Stream the response content
+            async def generate():
+                yield response.content
+
+            return StreamingResponse(
+                generate(),
+                media_type=mime_type,
+                headers={
+                    "Content-Disposition": f'inline; filename="{filename}"',
+                    "Cache-Control": "public, max-age=86400",  # Cache for 24 hours
+                }
+            )
+
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=e.response.status_code, detail="Failed to fetch thumbnail from JIRA")
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to connect to JIRA: {str(e)}")
